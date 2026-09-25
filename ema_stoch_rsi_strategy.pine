@@ -1,0 +1,2636 @@
+//@version=6
+strategy(
+     "EMA + Stoch RSI — HTF Stoch and RSI Entry Filters",
+     overlay = false,
+     pyramiding = 0,
+     initial_capital = 100000,
+     currency = currency.USD,
+     calc_on_order_fills = true,
+     process_orders_on_close = false
+)
+
+//=====================================================================
+// STRATEGY STRUCTURE
+// ENTRY:
+// EMA trend
+// + Stoch trigger (%K crosses above 25 / below 75)
+// + HTF Stoch protection
+// + HTF RSI momentum
+//
+// SIZE:
+// Base
+// + Chart RSI
+// + Selected RSI
+// + Supertrend
+//
+// EXIT:
+// Fixed TP
+// + Fixed SL
+//=====================================================================
+
+f_yesNo(bool condition) =>
+    condition ? "Yes" : "No"
+
+f_bonusText(bool enabled, bool condition) =>
+    not enabled
+     ? "OFF"
+     : condition
+       ? "+1"
+       : "0"
+
+f_roundDownToStep(float value, float stepSize) =>
+    not na(value) and stepSize > 0
+     ? math.floor(value / stepSize) * stepSize
+     : na
+
+// Convert a USD position amount into the symbol's order quantity.
+//
+// The strategy account currency is USD.
+// strategy.convert_to_symbol() converts the USD amount into
+// the chart symbol's quote currency when necessary.
+f_cashAmountToQuantity(float cashAmount) =>
+    float amountInSymbolCurrency =
+         strategy.convert_to_symbol(cashAmount)
+    float valuePerContract =
+         close * syminfo.pointvalue
+    valuePerContract > 0
+     ? amountInSymbolCurrency / valuePerContract
+     : na
+
+f_sizeText(
+     string sizingMode,
+     float lotSize,
+     float cashAmount
+) =>
+    sizingMode == "Lots"
+     ? str.tostring(lotSize, "#.##") + " Lots"
+     : "$" + str.tostring(cashAmount, "#.##")
+
+// Calculate Stochastic RSI %K inside any requested timeframe.
+f_stochRsiK(
+     int rsiLength,
+     int stochasticLength,
+     int kSmoothing
+) =>
+    float baseRsi =
+         ta.rsi(
+              close,
+              rsiLength
+         )
+    float lowestValue =
+         ta.lowest(
+              baseRsi,
+              stochasticLength
+         )
+    float highestValue =
+         ta.highest(
+              baseRsi,
+              stochasticLength
+         )
+    float valueRange =
+         highestValue -
+         lowestValue
+    float rawValue =
+         valueRange == 0.0
+         ? 0.0
+         : 100.0 *
+           (
+                baseRsi -
+                lowestValue
+           ) /
+           valueRange
+    ta.sma(
+         rawValue,
+         kSmoothing
+    )
+
+// Calculate Stochastic RSI %D inside any requested timeframe.
+f_stochRsiD(
+     int rsiLength,
+     int stochasticLength,
+     int kSmoothing,
+     int dSmoothing
+) =>
+    float kValue =
+         f_stochRsiK(
+              rsiLength,
+              stochasticLength,
+              kSmoothing
+         )
+    ta.sma(
+         kValue,
+         dSmoothing
+    )
+
+// Previous completed requested-timeframe values.
+// These helpers are used by the confirmed HTF mode.
+f_previousStochRsiK(
+     int rsiLength,
+     int stochasticLength,
+     int kSmoothing
+) =>
+    f_stochRsiK(
+         rsiLength,
+         stochasticLength,
+         kSmoothing
+    )[1]
+
+f_previousStochRsiD(
+     int rsiLength,
+     int stochasticLength,
+     int kSmoothing,
+     int dSmoothing
+) =>
+    f_stochRsiD(
+         rsiLength,
+         stochasticLength,
+         kSmoothing,
+         dSmoothing
+    )[1]
+
+// Calculate MACD line and signal line inside any requested timeframe.
+f_macdValues(
+     int fastLength,
+     int slowLength,
+     int signalLength
+) =>
+    [macdLineValue, signalLineValue, macdHistogramValue] =
+         ta.macd(
+              close,
+              fastLength,
+              slowLength,
+              signalLength
+         )
+
+    [macdLineValue, signalLineValue]
+
+// Previous completed requested-timeframe MACD values.
+// Used by the confirmed HTF MACD mode.
+f_previousMacdValues(
+     int fastLength,
+     int slowLength,
+     int signalLength
+) =>
+    [macdLineValue, signalLineValue, macdHistogramValue] =
+         ta.macd(
+              close,
+              fastLength,
+              slowLength,
+              signalLength
+         )
+
+    [macdLineValue[1], signalLineValue[1]]
+
+//=====================================================================
+// 1. EMA SETTINGS
+//=====================================================================
+
+ema1Length = input.int(
+     20,
+     "EMA 1 Length",
+     minval = 1,
+     group = "1. EMA Settings"
+)
+
+ema2Length = input.int(
+     50,
+     "EMA 2 Length",
+     minval = 1,
+     group = "1. EMA Settings"
+)
+
+ema3Length = input.int(
+     200,
+     "EMA 3 Length",
+     minval = 1,
+     group = "1. EMA Settings"
+)
+
+ema1 = ta.ema(close, ema1Length)
+ema2 = ta.ema(close, ema2Length)
+ema3 = ta.ema(close, ema3Length)
+
+// Buy:
+// Price > EMA 1 > EMA 2 > EMA 3.
+emaBuyCondition =
+     close > ema1 and
+     ema1 > ema2 and
+     ema2 > ema3
+
+// Sell:
+// Price < EMA 1 < EMA 2 < EMA 3.
+emaSellCondition =
+     close < ema1 and
+     ema1 < ema2 and
+     ema2 < ema3
+
+//=====================================================================
+// 2. STOCHASTIC RSI ENTRY SETTINGS
+//=====================================================================
+
+stochRsiLength = input.int(
+     14,
+     "Stoch RSI — RSI Length",
+     minval = 1,
+     group = "2. Stochastic RSI Entry"
+)
+
+stochLength = input.int(
+     14,
+     "Stoch RSI — Stochastic Length",
+     minval = 1,
+     group = "2. Stochastic RSI Entry"
+)
+
+stochKSmoothing = input.int(
+     3,
+     "Stoch RSI — %K Smoothing",
+     minval = 1,
+     group = "2. Stochastic RSI Entry"
+)
+
+stochDSmoothing = input.int(
+     3,
+     "Stoch RSI — %D Smoothing",
+     minval = 1,
+     group = "2. Stochastic RSI Entry"
+)
+
+// Oversold / Overbought are still used by the HTF Stoch RSI
+// entry filter and the pane zones. They no longer drive the
+// chart-timeframe trigger; see the trigger levels below.
+stochOversold = input.float(
+     20.0,
+     "Oversold Level",
+     minval = 0.0,
+     maxval = 100.0,
+     group = "2. Stochastic RSI Entry"
+)
+
+stochOverbought = input.float(
+     80.0,
+     "Overbought Level",
+     minval = 0.0,
+     maxval = 100.0,
+     group = "2. Stochastic RSI Entry"
+)
+
+stochBuyTriggerLevel = input.float(
+     25.0,
+     "Buy Trigger — %K Crosses Above",
+     minval = 0.0,
+     maxval = 100.0,
+     group = "2. Stochastic RSI Entry",
+     tooltip =
+          "A buy trigger fires on the bar where the chart-timeframe " +
+          "Stoch RSI %K crosses above this level."
+)
+
+stochSellTriggerLevel = input.float(
+     75.0,
+     "Sell Trigger — %K Crosses Below",
+     minval = 0.0,
+     maxval = 100.0,
+     group = "2. Stochastic RSI Entry",
+     tooltip =
+          "A sell trigger fires on the bar where the chart-timeframe " +
+          "Stoch RSI %K crosses below this level."
+)
+
+// Calculate Stochastic RSI.
+stochRsiBase =
+     ta.rsi(
+          close,
+          stochRsiLength
+     )
+
+lowestStochRsi =
+     ta.lowest(
+          stochRsiBase,
+          stochLength
+     )
+
+highestStochRsi =
+     ta.highest(
+          stochRsiBase,
+          stochLength
+     )
+
+stochRsiRange =
+     highestStochRsi -
+     lowestStochRsi
+
+stochRsiRaw =
+     stochRsiRange == 0.0
+     ? 0.0
+     : 100.0 *
+       (
+            stochRsiBase -
+            lowestStochRsi
+       ) /
+       stochRsiRange
+
+stochK =
+     ta.sma(
+          stochRsiRaw,
+          stochKSmoothing
+     )
+
+stochD =
+     ta.sma(
+          stochK,
+          stochDSmoothing
+     )
+
+// Buy trigger:
+// %K crosses above the buy trigger level (default 25).
+stochBuyTrigger =
+     ta.crossover(
+          stochK,
+          stochBuyTriggerLevel
+     )
+
+// Sell trigger:
+// %K crosses below the sell trigger level (default 75).
+stochSellTrigger =
+     ta.crossunder(
+          stochK,
+          stochSellTriggerLevel
+     )
+
+//=====================================================================
+// 3. CHART RSI BONUS
+//=====================================================================
+
+enableChartRsiBonus = input.bool(
+     true,
+     "Enable Chart RSI Additional Size",
+     group = "3. Chart RSI Bonus",
+     tooltip =
+          "Enabled: Chart RSI can add one additional sizing unit.\n\n" +
+          "Disabled: Chart RSI is ignored for position sizing."
+)
+
+chartRsiLength = input.int(
+     14,
+     "Chart RSI Length",
+     minval = 1,
+     group = "3. Chart RSI Bonus"
+)
+
+rsiMidpoint = input.float(
+     50.0,
+     "RSI Midpoint",
+     minval = 0.0,
+     maxval = 100.0,
+     group = "3. Chart RSI Bonus"
+)
+
+chartRsi =
+     ta.rsi(
+          close,
+          chartRsiLength
+     )
+
+// Raw chart RSI confirmations.
+chartRsiBuyConfirmation =
+     chartRsi > rsiMidpoint
+
+chartRsiSellConfirmation =
+     chartRsi < rsiMidpoint
+
+// Active chart RSI bonuses.
+chartRsiBuyBonus =
+     enableChartRsiBonus and
+     chartRsiBuyConfirmation
+
+chartRsiSellBonus =
+     enableChartRsiBonus and
+     chartRsiSellConfirmation
+
+//=====================================================================
+// 4. SELECTED-TIMEFRAME RSI BONUS
+//=====================================================================
+
+enableSelectedRsiBonus = input.bool(
+     true,
+     "Enable Selected-Timeframe RSI Additional Size",
+     group = "4. Selected-Timeframe RSI Bonus",
+     tooltip =
+          "Enabled: Selected-timeframe RSI can add one sizing unit.\n\n" +
+          "Disabled: Selected-timeframe RSI is ignored for sizing."
+)
+
+levelRsiTimeframe = input.timeframe(
+     "5",
+     "RSI Bonus Timeframe",
+     options = [
+          "1",
+          "3",
+          "5",
+          "15",
+          "30",
+          "45",
+          "60",
+          "120",
+          "240",
+          "D",
+          "W"
+     ],
+     group = "4. Selected-Timeframe RSI Bonus"
+)
+
+levelRsiLength = input.int(
+     14,
+     "Selected-Timeframe RSI Length",
+     minval = 1,
+     group = "4. Selected-Timeframe RSI Bonus"
+)
+
+useConfirmedLevelRsi = input.bool(
+     true,
+     "Use Confirmed Selected-Timeframe RSI",
+     group = "4. Selected-Timeframe RSI Bonus",
+     tooltip =
+          "Enabled: uses the most recently completed candle from the " +
+          "selected RSI timeframe.\n\n" +
+          "Disabled: uses the currently forming selected-timeframe candle."
+)
+
+// Live selected-timeframe RSI.
+levelRsiLive =
+     request.security(
+          syminfo.tickerid,
+          levelRsiTimeframe,
+          ta.rsi(
+               close,
+               levelRsiLength
+          ),
+          gaps = barmerge.gaps_off,
+          lookahead = barmerge.lookahead_off
+     )
+
+// Confirmed selected-timeframe RSI.
+levelRsiConfirmed =
+     request.security(
+          syminfo.tickerid,
+          levelRsiTimeframe,
+          ta.rsi(
+               close,
+               levelRsiLength
+          )[1],
+          gaps = barmerge.gaps_off,
+          lookahead = barmerge.lookahead_on
+     )
+
+levelRsi =
+     useConfirmedLevelRsi
+     ? levelRsiConfirmed
+     : levelRsiLive
+
+// Selected timeframe must be equal to or higher than
+// the current chart timeframe.
+levelTimeframeIsValid =
+     timeframe.in_seconds(
+          levelRsiTimeframe
+     ) >=
+     timeframe.in_seconds()
+
+// Raw selected-timeframe RSI confirmations.
+levelRsiBuyConfirmation =
+     levelTimeframeIsValid and
+     not na(levelRsi) and
+     levelRsi > rsiMidpoint
+
+levelRsiSellConfirmation =
+     levelTimeframeIsValid and
+     not na(levelRsi) and
+     levelRsi < rsiMidpoint
+
+// Active selected-timeframe RSI bonuses.
+levelRsiBuyBonus =
+     enableSelectedRsiBonus and
+     levelRsiBuyConfirmation
+
+levelRsiSellBonus =
+     enableSelectedRsiBonus and
+     levelRsiSellConfirmation
+
+//=====================================================================
+// 5. SUPERTREND BONUS
+//=====================================================================
+
+enableSupertrendBonus = input.bool(
+     true,
+     "Enable Supertrend Additional Size",
+     group = "5. Supertrend Bonus",
+     tooltip =
+          "Enabled: Supertrend can add one sizing unit.\n\n" +
+          "Disabled: Supertrend is ignored for position sizing."
+)
+
+supertrendAtrLength = input.int(
+     10,
+     "Supertrend ATR Length",
+     minval = 1,
+     group = "5. Supertrend Bonus"
+)
+
+supertrendFactor = input.float(
+     3.0,
+     "Supertrend Factor",
+     minval = 0.1,
+     step = 0.1,
+     group = "5. Supertrend Bonus"
+)
+
+[supertrendLine, supertrendDirection] =
+     ta.supertrend(
+          supertrendFactor,
+          supertrendAtrLength
+     )
+
+// Raw Supertrend confirmations.
+supertrendBuyConfirmation =
+     not na(supertrendLine) and
+     close > supertrendLine
+
+supertrendSellConfirmation =
+     not na(supertrendLine) and
+     close < supertrendLine
+
+// Active Supertrend bonuses.
+supertrendBuyBonus =
+     enableSupertrendBonus and
+     supertrendBuyConfirmation
+
+supertrendSellBonus =
+     enableSupertrendBonus and
+     supertrendSellConfirmation
+
+//=====================================================================
+// 6. HIGHER-TIMEFRAME STOCH RSI ENTRY FILTER
+//
+// This is a mandatory ENTRY FILTER, not a position-size bonus.
+//
+// Buy is blocked when the selected-timeframe Stoch RSI is BOTH:
+// 1. Above the overbought level; and
+// 2. Crossing downward.
+//
+// Sell is blocked when the selected-timeframe Stoch RSI is BOTH:
+// 1. Below the oversold level; and
+// 2. Crossing upward.
+//=====================================================================
+
+htfStochTimeframe = input.timeframe(
+     "15",
+     "Higher-Timeframe Stoch RSI",
+     options = [
+          "1",
+          "3",
+          "5",
+          "15",
+          "30",
+          "45",
+          "60",
+          "120",
+          "240",
+          "D",
+          "W"
+     ],
+     group = "6. HTF Stoch RSI Entry Filter"
+)
+
+htfStochRsiLength = input.int(
+     14,
+     "HTF Stoch RSI — RSI Length",
+     minval = 1,
+     group = "6. HTF Stoch RSI Entry Filter"
+)
+
+htfStochLength = input.int(
+     14,
+     "HTF Stoch RSI — Stochastic Length",
+     minval = 1,
+     group = "6. HTF Stoch RSI Entry Filter"
+)
+
+htfStochKSmoothing = input.int(
+     3,
+     "HTF Stoch RSI — %K Smoothing",
+     minval = 1,
+     group = "6. HTF Stoch RSI Entry Filter"
+)
+
+htfStochDSmoothing = input.int(
+     3,
+     "HTF Stoch RSI — %D Smoothing",
+     minval = 1,
+     group = "6. HTF Stoch RSI Entry Filter"
+)
+
+useConfirmedHtfStoch = input.bool(
+     true,
+     "Use Confirmed Higher-Timeframe Stoch RSI",
+     group = "6. HTF Stoch RSI Entry Filter",
+     tooltip =
+          "Enabled: uses the most recently completed candle from the selected " +
+          "Stoch RSI timeframe. This is more stable for backtesting.\n\n" +
+          "Disabled: uses the currently forming selected-timeframe candle, " +
+          "which reacts faster but can change before that candle closes."
+)
+
+// Live selected-timeframe Stoch RSI values.
+[htfStochKLive, htfStochDLive] =
+     request.security(
+          syminfo.tickerid,
+          htfStochTimeframe,
+          [
+               f_stochRsiK(
+                    htfStochRsiLength,
+                    htfStochLength,
+                    htfStochKSmoothing
+               ),
+               f_stochRsiD(
+                    htfStochRsiLength,
+                    htfStochLength,
+                    htfStochKSmoothing,
+                    htfStochDSmoothing
+               )
+          ],
+          gaps = barmerge.gaps_off,
+          lookahead = barmerge.lookahead_off
+     )
+
+// Confirmed selected-timeframe Stoch RSI values.
+[htfStochKConfirmed, htfStochDConfirmed] =
+     request.security(
+          syminfo.tickerid,
+          htfStochTimeframe,
+          [
+               f_previousStochRsiK(
+                    htfStochRsiLength,
+                    htfStochLength,
+                    htfStochKSmoothing
+               ),
+               f_previousStochRsiD(
+                    htfStochRsiLength,
+                    htfStochLength,
+                    htfStochKSmoothing,
+                    htfStochDSmoothing
+               )
+          ],
+          gaps = barmerge.gaps_off,
+          lookahead = barmerge.lookahead_on
+     )
+
+htfStochK =
+     useConfirmedHtfStoch
+     ? htfStochKConfirmed
+     : htfStochKLive
+
+htfStochD =
+     useConfirmedHtfStoch
+     ? htfStochDConfirmed
+     : htfStochDLive
+
+htfStochTimeframeIsValid =
+     timeframe.in_seconds(
+          htfStochTimeframe
+     ) >=
+     timeframe.in_seconds()
+
+htfStochAboveOverbought =
+     not na(htfStochK) and
+     not na(htfStochD) and
+     htfStochK > stochOverbought and
+     htfStochD > stochOverbought
+
+htfStochBelowOversold =
+     not na(htfStochK) and
+     not na(htfStochD) and
+     htfStochK < stochOversold and
+     htfStochD < stochOversold
+
+htfStochCrossingDown =
+     ta.crossunder(
+          htfStochK,
+          htfStochD
+     )
+
+htfStochCrossingUp =
+     ta.crossover(
+          htfStochK,
+          htfStochD
+     )
+
+// Combined blocking conditions requested by the strategy.
+//
+// Long is blocked only when HTF Stoch RSI is overbought
+// AND crossing downward.
+//
+// Short is blocked only when HTF Stoch RSI is oversold
+// AND crossing upward.
+htfLongBlocked =
+     htfStochAboveOverbought and
+     htfStochCrossingDown
+
+htfShortBlocked =
+     htfStochBelowOversold and
+     htfStochCrossingUp
+
+htfLongFilterPass =
+     htfStochTimeframeIsValid and
+     not htfLongBlocked
+
+htfShortFilterPass =
+     htfStochTimeframeIsValid and
+     not htfShortBlocked
+
+//=====================================================================
+// 7. HIGHER-TIMEFRAME RSI ENTRY FILTER
+//
+// This is a mandatory ENTRY FILTER, not a position-size bonus.
+//
+// Buy requires the selected-timeframe RSI to be:
+// Above 50 and below 80.
+//
+// Sell requires the selected-timeframe RSI to be:
+// Below 50 and above 20.
+//=====================================================================
+
+entryRsiTimeframe = input.timeframe(
+     "15",
+     "Higher-Timeframe RSI Entry Filter",
+     options = [
+          "1",
+          "3",
+          "5",
+          "15",
+          "30",
+          "45",
+          "60",
+          "120",
+          "240",
+          "D",
+          "W"
+     ],
+     group = "7. HTF RSI Entry Filter"
+)
+
+entryRsiLength = input.int(
+     14,
+     "HTF RSI Length",
+     minval = 1,
+     group = "7. HTF RSI Entry Filter"
+)
+
+entryRsiMidpoint = input.float(
+     50.0,
+     "HTF RSI Midpoint",
+     minval = 0.0,
+     maxval = 100.0,
+     group = "7. HTF RSI Entry Filter"
+)
+
+entryRsiUpperLimit = input.float(
+     80.0,
+     "HTF RSI Buy Upper Limit",
+     minval = 0.0,
+     maxval = 100.0,
+     group = "7. HTF RSI Entry Filter"
+)
+
+entryRsiLowerLimit = input.float(
+     20.0,
+     "HTF RSI Sell Lower Limit",
+     minval = 0.0,
+     maxval = 100.0,
+     group = "7. HTF RSI Entry Filter"
+)
+
+useConfirmedEntryRsi = input.bool(
+     true,
+     "Use Confirmed Higher-Timeframe RSI",
+     group = "7. HTF RSI Entry Filter",
+     tooltip =
+          "Enabled: uses the most recently completed candle from the selected " +
+          "RSI entry-filter timeframe. This is more stable for backtesting.\n\n" +
+          "Disabled: uses the currently forming selected-timeframe RSI, " +
+          "which can change before that candle closes."
+)
+
+entryRsiLive =
+     request.security(
+          syminfo.tickerid,
+          entryRsiTimeframe,
+          ta.rsi(
+               close,
+               entryRsiLength
+          ),
+          gaps = barmerge.gaps_off,
+          lookahead = barmerge.lookahead_off
+     )
+
+entryRsiConfirmed =
+     request.security(
+          syminfo.tickerid,
+          entryRsiTimeframe,
+          ta.rsi(
+               close,
+               entryRsiLength
+          )[1],
+          gaps = barmerge.gaps_off,
+          lookahead = barmerge.lookahead_on
+     )
+
+entryRsi =
+     useConfirmedEntryRsi
+     ? entryRsiConfirmed
+     : entryRsiLive
+
+entryRsiTimeframeIsValid =
+     timeframe.in_seconds(
+          entryRsiTimeframe
+     ) >=
+     timeframe.in_seconds()
+
+htfRsiLongFilterPass =
+     entryRsiTimeframeIsValid and
+     not na(entryRsi) and
+     entryRsi > entryRsiMidpoint and
+     entryRsi < entryRsiUpperLimit
+
+htfRsiShortFilterPass =
+     entryRsiTimeframeIsValid and
+     not na(entryRsi) and
+     entryRsi < entryRsiMidpoint and
+     entryRsi > entryRsiLowerLimit
+
+//=====================================================================
+// 7B. HIGHER-TIMEFRAME MACD ENTRY FILTER
+//
+// This is an OPTIONAL entry filter.
+//
+// When the switch is ON:
+//
+// BUY requires:
+// 1. HTF MACD line > 0.
+// 2. HTF MACD line > HTF signal line.
+//
+// SELL requires:
+// 1. HTF MACD line < 0.
+// 2. HTF MACD line < HTF signal line.
+//
+// When the switch is OFF, the MACD filter is bypassed and all of the
+// original strategy entry rules remain exactly as before.
+//=====================================================================
+
+enableHtfMacdFilter = input.bool(
+     true,
+     "Enable Higher-Timeframe MACD Entry Filter",
+     group = "7B. HTF MACD Entry Filter",
+     tooltip =
+          "ON: MACD becomes an additional mandatory entry condition.\n\n" +
+          "OFF: MACD is ignored and the original entry rules are used."
+)
+
+htfMacdTimeframe = input.timeframe(
+     "15",
+     "Higher-Timeframe MACD",
+     options = [
+          "1",
+          "3",
+          "5",
+          "15",
+          "30",
+          "45",
+          "60",
+          "120",
+          "240",
+          "D",
+          "W"
+     ],
+     group = "7B. HTF MACD Entry Filter"
+)
+
+htfMacdFastLength = input.int(
+     12,
+     "HTF MACD Fast Length",
+     minval = 1,
+     group = "7B. HTF MACD Entry Filter"
+)
+
+htfMacdSlowLength = input.int(
+     26,
+     "HTF MACD Slow Length",
+     minval = 1,
+     group = "7B. HTF MACD Entry Filter"
+)
+
+htfMacdSignalLength = input.int(
+     9,
+     "HTF MACD Signal Length",
+     minval = 1,
+     group = "7B. HTF MACD Entry Filter"
+)
+
+useConfirmedHtfMacd = input.bool(
+     true,
+     "Use Confirmed Higher-Timeframe MACD",
+     group = "7B. HTF MACD Entry Filter",
+     tooltip =
+          "Enabled: uses the most recently completed candle from the selected " +
+          "MACD timeframe.\n\n" +
+          "Disabled: uses the currently forming selected-timeframe MACD."
+)
+
+// Live HTF MACD.
+[htfMacdLineLive, htfMacdSignalLive] =
+     request.security(
+          syminfo.tickerid,
+          htfMacdTimeframe,
+          f_macdValues(
+               htfMacdFastLength,
+               htfMacdSlowLength,
+               htfMacdSignalLength
+          ),
+          gaps = barmerge.gaps_off,
+          lookahead = barmerge.lookahead_off
+     )
+
+// Confirmed HTF MACD.
+[htfMacdLineConfirmed, htfMacdSignalConfirmed] =
+     request.security(
+          syminfo.tickerid,
+          htfMacdTimeframe,
+          f_previousMacdValues(
+               htfMacdFastLength,
+               htfMacdSlowLength,
+               htfMacdSignalLength
+          ),
+          gaps = barmerge.gaps_off,
+          lookahead = barmerge.lookahead_on
+     )
+
+htfMacdLine =
+     useConfirmedHtfMacd
+     ? htfMacdLineConfirmed
+     : htfMacdLineLive
+
+htfMacdSignal =
+     useConfirmedHtfMacd
+     ? htfMacdSignalConfirmed
+     : htfMacdSignalLive
+
+htfMacdTimeframeIsValid =
+     timeframe.in_seconds(
+          htfMacdTimeframe
+     ) >=
+     timeframe.in_seconds()
+
+// BUY MACD confirmation:
+// MACD must be above zero AND above its signal line.
+htfMacdLongConfirmation =
+     htfMacdTimeframeIsValid and
+     not na(htfMacdLine) and
+     not na(htfMacdSignal) and
+     htfMacdLine > 0 and
+     htfMacdLine > htfMacdSignal
+
+// SELL MACD confirmation:
+// MACD must be below zero AND below its signal line.
+htfMacdShortConfirmation =
+     htfMacdTimeframeIsValid and
+     not na(htfMacdLine) and
+     not na(htfMacdSignal) and
+     htfMacdLine < 0 and
+     htfMacdLine < htfMacdSignal
+
+// OFF = bypass the MACD filter.
+// ON = MACD becomes mandatory.
+htfMacdLongFilterPass =
+     not enableHtfMacdFilter or
+     htfMacdLongConfirmation
+
+htfMacdShortFilterPass =
+     not enableHtfMacdFilter or
+     htfMacdShortConfirmation
+
+//=====================================================================
+// 8. ENTRY CONDITIONS
+//=====================================================================
+
+// A trade opens only when all original checks pass.
+// When the HTF MACD switch is ON, MACD becomes a fifth requirement:
+// 1. Three-EMA alignment.
+// 2. Chart-timeframe Stoch RSI %K crossing the trigger level
+//    (above 25 for buys, below 75 for sells).
+// 3. Higher-timeframe Stoch RSI requirement.
+// 4. Higher-timeframe RSI range requirement.
+// 5. Higher-timeframe MACD confirmation, when enabled.
+
+longEntryCondition =
+     emaBuyCondition and
+     stochBuyTrigger and
+     htfLongFilterPass and
+     htfRsiLongFilterPass and
+     htfMacdLongFilterPass
+
+shortEntryCondition =
+     emaSellCondition and
+     stochSellTrigger and
+     htfShortFilterPass and
+     htfRsiShortFilterPass and
+     htfMacdShortFilterPass
+
+//=====================================================================
+// 9. POSITION-SIZING MODE
+//=====================================================================
+
+positionSizingMode = input.string(
+     "Lots",
+     "Position Sizing Mode",
+     options = [
+          "Lots",
+          "Cash Amount (USD)"
+     ],
+     group = "8. Position Sizing Mode",
+     tooltip =
+          "Lots: order size is based on lot values and Quantity Per Lot.\n\n" +
+          "Cash Amount: order size represents approximate USD position value, " +
+          "not the maximum loss on the trade."
+)
+
+//=====================================================================
+// 10. LOT-SIZING MODE
+//=====================================================================
+
+baseLotSize = input.float(
+     1.0,
+     "Base Lot Size",
+     minval = 0.01,
+     step = 0.01,
+     group = "9. Lot Sizing"
+)
+
+chartRsiBonusLotSize = input.float(
+     1.0,
+     "Chart RSI Bonus Lots",
+     minval = 0.0,
+     step = 0.01,
+     group = "9. Lot Sizing"
+)
+
+levelRsiBonusLotSize = input.float(
+     1.0,
+     "Selected RSI Bonus Lots",
+     minval = 0.0,
+     step = 0.01,
+     group = "9. Lot Sizing"
+)
+
+supertrendBonusLotSize = input.float(
+     1.0,
+     "Supertrend Bonus Lots",
+     minval = 0.0,
+     step = 0.01,
+     group = "9. Lot Sizing"
+)
+
+maximumLotSize = input.float(
+     4.0,
+     "Maximum Lot Size",
+     minval = 0.01,
+     step = 0.01,
+     group = "9. Lot Sizing"
+)
+
+// Examples:
+//
+// Quantity already represents lots:
+// 1
+//
+// Standard Forex lot equals 100,000 units:
+// 100000
+//
+// Gold lot equals 100 ounces/contracts:
+// 100
+quantityPerLot = input.float(
+     1.0,
+     "TradingView Quantity Per 1 Lot",
+     minval = 0.000001,
+     step = 1.0,
+     group = "9. Lot Sizing"
+)
+
+//=====================================================================
+// 11. CASH-AMOUNT SIZING MODE
+//=====================================================================
+
+baseCashAmount = input.float(
+     1000.0,
+     "Base Position Amount — USD",
+     minval = 0.01,
+     step = 100.0,
+     group = "10. Cash Amount Sizing"
+)
+
+chartRsiBonusCashAmount = input.float(
+     1000.0,
+     "Chart RSI Bonus Amount — USD",
+     minval = 0.0,
+     step = 100.0,
+     group = "10. Cash Amount Sizing"
+)
+
+levelRsiBonusCashAmount = input.float(
+     1000.0,
+     "Selected RSI Bonus Amount — USD",
+     minval = 0.0,
+     step = 100.0,
+     group = "10. Cash Amount Sizing"
+)
+
+supertrendBonusCashAmount = input.float(
+     1000.0,
+     "Supertrend Bonus Amount — USD",
+     minval = 0.0,
+     step = 100.0,
+     group = "10. Cash Amount Sizing"
+)
+
+maximumCashAmount = input.float(
+     4000.0,
+     "Maximum Position Amount — USD",
+     minval = 0.01,
+     step = 100.0,
+     group = "10. Cash Amount Sizing"
+)
+
+// Controls how the calculated TradingView quantity is rounded.
+//
+// Examples:
+// Stocks or Forex units: 1
+// Fractional contracts: 0.01
+// Crypto: 0.0001
+orderQuantityStep = input.float(
+     0.01,
+     "Order Quantity Step",
+     minval = 0.000001,
+     step = 0.01,
+     group = "10. Cash Amount Sizing"
+)
+
+minimumOrderQuantity = input.float(
+     0.01,
+     "Minimum Valid Order Quantity",
+     minval = 0.000001,
+     step = 0.01,
+     group = "10. Cash Amount Sizing"
+)
+
+//=====================================================================
+// 12. BUY POSITION-SIZE CALCULATIONS
+//=====================================================================
+
+// Lot-mode contributions.
+longChartRsiLotBonus =
+     chartRsiBuyBonus
+     ? chartRsiBonusLotSize
+     : 0.0
+
+longLevelRsiLotBonus =
+     levelRsiBuyBonus
+     ? levelRsiBonusLotSize
+     : 0.0
+
+longSupertrendLotBonus =
+     supertrendBuyBonus
+     ? supertrendBonusLotSize
+     : 0.0
+
+calculatedLongLotSize =
+     math.min(
+          maximumLotSize,
+          baseLotSize +
+          longChartRsiLotBonus +
+          longLevelRsiLotBonus +
+          longSupertrendLotBonus
+     )
+
+// Cash-mode contributions.
+longChartRsiCashBonus =
+     chartRsiBuyBonus
+     ? chartRsiBonusCashAmount
+     : 0.0
+
+longLevelRsiCashBonus =
+     levelRsiBuyBonus
+     ? levelRsiBonusCashAmount
+     : 0.0
+
+longSupertrendCashBonus =
+     supertrendBuyBonus
+     ? supertrendBonusCashAmount
+     : 0.0
+
+calculatedLongCashAmount =
+     math.min(
+          maximumCashAmount,
+          baseCashAmount +
+          longChartRsiCashBonus +
+          longLevelRsiCashBonus +
+          longSupertrendCashBonus
+     )
+
+// Convert the selected sizing mode into TradingView quantity.
+longQuantityFromLots =
+     calculatedLongLotSize *
+     quantityPerLot
+
+longQuantityFromCash =
+     f_cashAmountToQuantity(
+          calculatedLongCashAmount
+     )
+
+longQuantityRaw =
+     positionSizingMode == "Lots"
+     ? longQuantityFromLots
+     : longQuantityFromCash
+
+calculatedLongQuantity =
+     f_roundDownToStep(
+          longQuantityRaw,
+          orderQuantityStep
+     )
+
+longQuantityIsValid =
+     not na(calculatedLongQuantity) and
+     calculatedLongQuantity >= minimumOrderQuantity
+
+//=====================================================================
+// 13. SELL POSITION-SIZE CALCULATIONS
+//=====================================================================
+
+// Lot-mode contributions.
+shortChartRsiLotBonus =
+     chartRsiSellBonus
+     ? chartRsiBonusLotSize
+     : 0.0
+
+shortLevelRsiLotBonus =
+     levelRsiSellBonus
+     ? levelRsiBonusLotSize
+     : 0.0
+
+shortSupertrendLotBonus =
+     supertrendSellBonus
+     ? supertrendBonusLotSize
+     : 0.0
+
+calculatedShortLotSize =
+     math.min(
+          maximumLotSize,
+          baseLotSize +
+          shortChartRsiLotBonus +
+          shortLevelRsiLotBonus +
+          shortSupertrendLotBonus
+     )
+
+// Cash-mode contributions.
+shortChartRsiCashBonus =
+     chartRsiSellBonus
+     ? chartRsiBonusCashAmount
+     : 0.0
+
+shortLevelRsiCashBonus =
+     levelRsiSellBonus
+     ? levelRsiBonusCashAmount
+     : 0.0
+
+shortSupertrendCashBonus =
+     supertrendSellBonus
+     ? supertrendBonusCashAmount
+     : 0.0
+
+calculatedShortCashAmount =
+     math.min(
+          maximumCashAmount,
+          baseCashAmount +
+          shortChartRsiCashBonus +
+          shortLevelRsiCashBonus +
+          shortSupertrendCashBonus
+     )
+
+shortQuantityFromLots =
+     calculatedShortLotSize *
+     quantityPerLot
+
+shortQuantityFromCash =
+     f_cashAmountToQuantity(
+          calculatedShortCashAmount
+     )
+
+shortQuantityRaw =
+     positionSizingMode == "Lots"
+     ? shortQuantityFromLots
+     : shortQuantityFromCash
+
+calculatedShortQuantity =
+     f_roundDownToStep(
+          shortQuantityRaw,
+          orderQuantityStep
+     )
+
+shortQuantityIsValid =
+     not na(calculatedShortQuantity) and
+     calculatedShortQuantity >= minimumOrderQuantity
+
+//=====================================================================
+// 14. STORE ACTIVE TRADE INFORMATION
+//=====================================================================
+
+var float activeSizingValue = na
+var float activeOrderQuantity = na
+var int activeChartRsiBonus = 0
+var int activeLevelRsiBonus = 0
+var int activeSupertrendBonus = 0
+var string activeSizingMode = ""
+
+//=====================================================================
+// 15. TAKE-PROFIT AND STOP-LOSS
+//=====================================================================
+
+takeProfitPips = input.float(
+     200.0,
+     "Take Profit in Pips",
+     minval = 0.1,
+     step = 1.0,
+     group = "11. TP and SL"
+)
+
+stopLossPips = input.float(
+     500.0,
+     "Stop Loss in Pips",
+     minval = 0.1,
+     step = 1.0,
+     group = "11. TP and SL"
+)
+
+ticksPerPip = input.float(
+     10.0,
+     "Ticks Per Pip",
+     minval = 0.0001,
+     step = 1.0,
+     group = "11. TP and SL"
+)
+
+takeProfitTicks =
+     math.max(
+          1,
+          int(
+               math.round(
+                    takeProfitPips *
+                    ticksPerPip
+               )
+          )
+     )
+
+stopLossTicks =
+     math.max(
+          1,
+          int(
+               math.round(
+                    stopLossPips *
+                    ticksPerPip
+               )
+          )
+     )
+
+//=====================================================================
+// 16. EXECUTION
+//=====================================================================
+
+enableLongTrades = input.bool(
+     true,
+     "Enable Buy Trades",
+     group = "12. Execution"
+)
+
+enableShortTrades = input.bool(
+     true,
+     "Enable Sell Trades",
+     group = "12. Execution"
+)
+
+longOrderComment =
+     positionSizingMode == "Lots"
+     ? "BUY " +
+       str.tostring(
+            calculatedLongLotSize,
+            "#.##"
+       ) +
+       " Lots"
+     : "BUY $" +
+       str.tostring(
+            calculatedLongCashAmount,
+            "#.##"
+       ) +
+       " | Qty " +
+       str.tostring(
+            calculatedLongQuantity,
+            "#.######"
+       )
+
+shortOrderComment =
+     positionSizingMode == "Lots"
+     ? "SELL " +
+       str.tostring(
+            calculatedShortLotSize,
+            "#.##"
+       ) +
+       " Lots"
+     : "SELL $" +
+       str.tostring(
+            calculatedShortCashAmount,
+            "#.##"
+       ) +
+       " | Qty " +
+       str.tostring(
+            calculatedShortQuantity,
+            "#.######"
+       )
+
+// Enter only when no position is open.
+if strategy.position_size == 0
+    if (
+         enableLongTrades and
+         longEntryCondition and
+         longQuantityIsValid
+    )
+        activeSizingValue :=
+             positionSizingMode == "Lots"
+             ? calculatedLongLotSize
+             : calculatedLongCashAmount
+        activeOrderQuantity :=
+             calculatedLongQuantity
+        activeChartRsiBonus :=
+             chartRsiBuyBonus
+             ? 1
+             : 0
+        activeLevelRsiBonus :=
+             levelRsiBuyBonus
+             ? 1
+             : 0
+        activeSupertrendBonus :=
+             supertrendBuyBonus
+             ? 1
+             : 0
+        activeSizingMode :=
+             positionSizingMode
+        strategy.entry(
+             "Buy",
+             strategy.long,
+             qty = calculatedLongQuantity,
+             comment = longOrderComment
+        )
+    else if (
+         enableShortTrades and
+         shortEntryCondition and
+         shortQuantityIsValid
+    )
+        activeSizingValue :=
+             positionSizingMode == "Lots"
+             ? calculatedShortLotSize
+             : calculatedShortCashAmount
+        activeOrderQuantity :=
+             calculatedShortQuantity
+        activeChartRsiBonus :=
+             chartRsiSellBonus
+             ? 1
+             : 0
+        activeLevelRsiBonus :=
+             levelRsiSellBonus
+             ? 1
+             : 0
+        activeSupertrendBonus :=
+             supertrendSellBonus
+             ? 1
+             : 0
+        activeSizingMode :=
+             positionSizingMode
+        strategy.entry(
+             "Sell",
+             strategy.short,
+             qty = calculatedShortQuantity,
+             comment = shortOrderComment
+        )
+
+// Fixed TP and SL.
+strategy.exit(
+     "Buy TP/SL",
+     from_entry = "Buy",
+     profit = takeProfitTicks,
+     loss = stopLossTicks
+)
+
+strategy.exit(
+     "Sell TP/SL",
+     from_entry = "Sell",
+     profit = takeProfitTicks,
+     loss = stopLossTicks
+)
+
+// Clear stored information after the trade closes.
+tradeJustClosed =
+     strategy.position_size == 0 and
+     strategy.position_size[1] != 0
+
+if tradeJustClosed
+    activeSizingValue := na
+    activeOrderQuantity := na
+    activeChartRsiBonus := 0
+    activeLevelRsiBonus := 0
+    activeSupertrendBonus := 0
+    activeSizingMode := ""
+
+//=====================================================================
+// 17. STOCH RSI PANE DISPLAY
+//
+// The strategy occupies a separate pane because overlay=false.
+// Price-related visuals are forced onto the main chart in the
+// following sections using force_overlay=true.
+//=====================================================================
+
+stochKPanePlot =
+     plot(
+          stochK,
+          "Chart Stoch RSI %K",
+          color = color.blue,
+          linewidth = 2
+     )
+
+stochDPanePlot =
+     plot(
+          stochD,
+          "Chart Stoch RSI %D",
+          color = color.orange,
+          linewidth = 2
+     )
+
+stochUpperBoundary =
+     hline(
+          100.0,
+          "Stoch RSI Maximum",
+          color = color.new(color.gray, 100)
+     )
+
+stochOverboughtLine =
+     hline(
+          stochOverbought,
+          "Stoch RSI Overbought",
+          color = color.red,
+          linestyle = hline.style_dashed
+     )
+
+stochMidline =
+     hline(
+          50.0,
+          "Stoch RSI Midpoint",
+          color = color.new(color.gray, 55),
+          linestyle = hline.style_dotted
+     )
+
+stochOversoldLine =
+     hline(
+          stochOversold,
+          "Stoch RSI Oversold",
+          color = color.green,
+          linestyle = hline.style_dashed
+     )
+
+stochLowerBoundary =
+     hline(
+          0.0,
+          "Stoch RSI Minimum",
+          color = color.new(color.gray, 100)
+     )
+
+// Trigger levels used by the chart-timeframe entry trigger.
+hline(
+     stochSellTriggerLevel,
+     "Stoch RSI Sell Trigger Level",
+     color = color.new(color.red, 40),
+     linestyle = hline.style_dotted
+)
+
+hline(
+     stochBuyTriggerLevel,
+     "Stoch RSI Buy Trigger Level",
+     color = color.new(color.green, 40),
+     linestyle = hline.style_dotted
+)
+
+fill(
+     stochUpperBoundary,
+     stochOverboughtLine,
+     color = color.new(color.red, 90),
+     title = "Overbought Zone"
+)
+
+fill(
+     stochOversoldLine,
+     stochLowerBoundary,
+     color = color.new(color.green, 90),
+     title = "Oversold Zone"
+)
+
+// Mark the chart-timeframe Stoch RSI triggers used by the strategy.
+plotshape(
+     stochBuyTrigger
+     ? stochK
+     : na,
+     title = "Stoch RSI Buy Trigger",
+     style = shape.triangleup,
+     location = location.absolute,
+     color = color.lime,
+     text = "B",
+     textcolor = color.white,
+     size = size.tiny
+)
+
+plotshape(
+     stochSellTrigger
+     ? stochK
+     : na,
+     title = "Stoch RSI Sell Trigger",
+     style = shape.triangledown,
+     location = location.absolute,
+     color = color.red,
+     text = "S",
+     textcolor = color.white,
+     size = size.tiny
+)
+
+//=====================================================================
+// 18. MAIN-CHART INDICATOR DISPLAY
+//=====================================================================
+
+plot(
+     ema1,
+     "EMA 1",
+     color = color.yellow,
+     linewidth = 2,
+     force_overlay = true
+)
+
+plot(
+     ema2,
+     "EMA 2",
+     color = color.orange,
+     linewidth = 2,
+     force_overlay = true
+)
+
+plot(
+     ema3,
+     "EMA 3",
+     color = color.red,
+     linewidth = 2,
+     force_overlay = true
+)
+
+// Supertrend remains visible even when its bonus is disabled.
+plot(
+     supertrendBuyConfirmation
+     ? supertrendLine
+     : na,
+     "Bullish Supertrend",
+     color = color.green,
+     linewidth = 2,
+     style = plot.style_linebr,
+     force_overlay = true
+)
+
+plot(
+     supertrendSellConfirmation
+     ? supertrendLine
+     : na,
+     "Bearish Supertrend",
+     color = color.red,
+     linewidth = 2,
+     style = plot.style_linebr,
+     force_overlay = true
+)
+
+//=====================================================================
+// 19. ENTRY MARKERS AND LABELS
+//=====================================================================
+
+plotshape(
+     longEntryCondition and
+     strategy.position_size == 0,
+     title = "Buy Signal",
+     style = shape.triangleup,
+     location = location.belowbar,
+     color = color.lime,
+     size = size.small,
+     text = "BUY",
+     force_overlay = true
+)
+
+plotshape(
+     shortEntryCondition and
+     strategy.position_size == 0,
+     title = "Sell Signal",
+     style = shape.triangledown,
+     location = location.abovebar,
+     color = color.red,
+     size = size.small,
+     text = "SELL",
+     force_overlay = true
+)
+
+if (
+     longEntryCondition and
+     strategy.position_size == 0 and
+     longQuantityIsValid
+)
+    label.new(
+         bar_index,
+         low,
+         "BUY\n" +
+         "Mode: " +
+         positionSizingMode +
+         "\nBase: " +
+         (
+              positionSizingMode == "Lots"
+              ? str.tostring(
+                   baseLotSize,
+                   "#.##"
+              )
+              : "$" +
+                str.tostring(
+                     baseCashAmount,
+                     "#.##"
+                )
+         ) +
+         "\nChart RSI: " +
+         f_bonusText(
+              enableChartRsiBonus,
+              chartRsiBuyConfirmation
+         ) +
+         "\nSelected RSI: " +
+         f_bonusText(
+              enableSelectedRsiBonus,
+              levelRsiBuyConfirmation
+         ) +
+         "\nSupertrend: " +
+         f_bonusText(
+              enableSupertrendBonus,
+              supertrendBuyConfirmation
+         ) +
+         "\nHTF Stoch Filter: PASS" +
+         "\nHTF RSI: " +
+         str.tostring(
+              entryRsi,
+              "#.##"
+         ) +
+         " (50-80)" +
+         "\nSelected Size: " +
+         f_sizeText(
+              positionSizingMode,
+              calculatedLongLotSize,
+              calculatedLongCashAmount
+         ) +
+         "\nOrder Qty: " +
+         str.tostring(
+              calculatedLongQuantity,
+              "#.######"
+         ),
+         style = label.style_label_up,
+         textcolor = color.white,
+         color = color.green,
+         force_overlay = true
+    )
+
+if (
+     shortEntryCondition and
+     strategy.position_size == 0 and
+     shortQuantityIsValid
+)
+    label.new(
+         bar_index,
+         high,
+         "SELL\n" +
+         "Mode: " +
+         positionSizingMode +
+         "\nBase: " +
+         (
+              positionSizingMode == "Lots"
+              ? str.tostring(
+                   baseLotSize,
+                   "#.##"
+              )
+              : "$" +
+                str.tostring(
+                     baseCashAmount,
+                     "#.##"
+                )
+         ) +
+         "\nChart RSI: " +
+         f_bonusText(
+              enableChartRsiBonus,
+              chartRsiSellConfirmation
+         ) +
+         "\nSelected RSI: " +
+         f_bonusText(
+              enableSelectedRsiBonus,
+              levelRsiSellConfirmation
+         ) +
+         "\nSupertrend: " +
+         f_bonusText(
+              enableSupertrendBonus,
+              supertrendSellConfirmation
+         ) +
+         "\nHTF Stoch Filter: PASS" +
+         "\nHTF RSI: " +
+         str.tostring(
+              entryRsi,
+              "#.##"
+         ) +
+         " (20-50)" +
+         "\nSelected Size: " +
+         f_sizeText(
+              positionSizingMode,
+              calculatedShortLotSize,
+              calculatedShortCashAmount
+         ) +
+         "\nOrder Qty: " +
+         str.tostring(
+              calculatedShortQuantity,
+              "#.######"
+         ),
+         style = label.style_label_down,
+         textcolor = color.white,
+         color = color.red,
+         force_overlay = true
+    )
+
+//=====================================================================
+// 20. CURRENT TP AND SL DISPLAY
+//=====================================================================
+
+longTakeProfitPrice =
+     strategy.position_size > 0
+     ? strategy.position_avg_price +
+       takeProfitTicks *
+       syminfo.mintick
+     : na
+
+longStopLossPrice =
+     strategy.position_size > 0
+     ? strategy.position_avg_price -
+       stopLossTicks *
+       syminfo.mintick
+     : na
+
+shortTakeProfitPrice =
+     strategy.position_size < 0
+     ? strategy.position_avg_price -
+       takeProfitTicks *
+       syminfo.mintick
+     : na
+
+shortStopLossPrice =
+     strategy.position_size < 0
+     ? strategy.position_avg_price +
+       stopLossTicks *
+       syminfo.mintick
+     : na
+
+currentTakeProfit =
+     strategy.position_size > 0
+     ? longTakeProfitPrice
+     : strategy.position_size < 0
+       ? shortTakeProfitPrice
+       : na
+
+currentStopLoss =
+     strategy.position_size > 0
+     ? longStopLossPrice
+     : strategy.position_size < 0
+       ? shortStopLossPrice
+       : na
+
+plot(
+     currentTakeProfit,
+     "Current Take Profit",
+     color = color.green,
+     linewidth = 2,
+     style = plot.style_linebr,
+     force_overlay = true
+)
+
+plot(
+     currentStopLoss,
+     "Current Stop Loss",
+     color = color.red,
+     linewidth = 2,
+     style = plot.style_linebr,
+     force_overlay = true
+)
+
+//=====================================================================
+// 21. DASHBOARD
+//=====================================================================
+
+var table dashboard =
+     table.new(
+          position.top_right,
+          3,
+          33,
+          border_width = 1,
+          force_overlay = true
+     )
+
+if barstate.islast
+    table.cell(
+         dashboard,
+         0,
+         0,
+         "Condition",
+         bgcolor = color.gray,
+         text_color = color.white
+    )
+    table.cell(
+         dashboard,
+         1,
+         0,
+         "Buy",
+         bgcolor = color.gray,
+         text_color = color.white
+    )
+    table.cell(
+         dashboard,
+         2,
+         0,
+         "Sell",
+         bgcolor = color.gray,
+         text_color = color.white
+    )
+
+    table.cell(dashboard, 0, 1, "EMA Alignment")
+    table.cell(
+         dashboard,
+         1,
+         1,
+         f_yesNo(emaBuyCondition)
+    )
+    table.cell(
+         dashboard,
+         2,
+         1,
+         f_yesNo(emaSellCondition)
+    )
+
+    table.cell(dashboard, 0, 2, "Stoch RSI Trigger")
+    table.cell(
+         dashboard,
+         1,
+         2,
+         f_yesNo(stochBuyTrigger)
+    )
+    table.cell(
+         dashboard,
+         2,
+         2,
+         f_yesNo(stochSellTrigger)
+    )
+
+    table.cell(dashboard, 0, 3, "Chart RSI")
+    table.cell(
+         dashboard,
+         1,
+         3,
+         str.tostring(chartRsi, "#.##")
+    )
+    table.cell(
+         dashboard,
+         2,
+         3,
+         str.tostring(chartRsi, "#.##")
+    )
+
+    table.cell(dashboard, 0, 4, "Chart RSI Bonus")
+    table.cell(
+         dashboard,
+         1,
+         4,
+         f_bonusText(
+              enableChartRsiBonus,
+              chartRsiBuyConfirmation
+         )
+    )
+    table.cell(
+         dashboard,
+         2,
+         4,
+         f_bonusText(
+              enableChartRsiBonus,
+              chartRsiSellConfirmation
+         )
+    )
+
+    table.cell(dashboard, 0, 5, "Selected RSI TF")
+    table.cell(
+         dashboard,
+         1,
+         5,
+         levelRsiTimeframe
+    )
+    table.cell(
+         dashboard,
+         2,
+         5,
+         levelRsiTimeframe
+    )
+
+    table.cell(dashboard, 0, 6, "Selected RSI")
+    table.cell(
+         dashboard,
+         1,
+         6,
+         str.tostring(levelRsi, "#.##")
+    )
+    table.cell(
+         dashboard,
+         2,
+         6,
+         str.tostring(levelRsi, "#.##")
+    )
+
+    table.cell(dashboard, 0, 7, "Selected RSI Bonus")
+    table.cell(
+         dashboard,
+         1,
+         7,
+         f_bonusText(
+              enableSelectedRsiBonus,
+              levelRsiBuyConfirmation
+         )
+    )
+    table.cell(
+         dashboard,
+         2,
+         7,
+         f_bonusText(
+              enableSelectedRsiBonus,
+              levelRsiSellConfirmation
+         )
+    )
+
+    table.cell(dashboard, 0, 8, "Supertrend")
+    table.cell(
+         dashboard,
+         1,
+         8,
+         str.tostring(
+              supertrendLine,
+              format.mintick
+         )
+    )
+    table.cell(
+         dashboard,
+         2,
+         8,
+         str.tostring(
+              supertrendLine,
+              format.mintick
+         )
+    )
+
+    table.cell(dashboard, 0, 9, "Supertrend Bonus")
+    table.cell(
+         dashboard,
+         1,
+         9,
+         f_bonusText(
+              enableSupertrendBonus,
+              supertrendBuyConfirmation
+         )
+    )
+    table.cell(
+         dashboard,
+         2,
+         9,
+         f_bonusText(
+              enableSupertrendBonus,
+              supertrendSellConfirmation
+         )
+    )
+
+    table.cell(dashboard, 0, 10, "Sizing Mode")
+    table.cell(
+         dashboard,
+         1,
+         10,
+         positionSizingMode
+    )
+    table.cell(
+         dashboard,
+         2,
+         10,
+         positionSizingMode
+    )
+
+    table.cell(dashboard, 0, 11, "Selected Size")
+    table.cell(
+         dashboard,
+         1,
+         11,
+         f_sizeText(
+              positionSizingMode,
+              calculatedLongLotSize,
+              calculatedLongCashAmount
+         )
+    )
+    table.cell(
+         dashboard,
+         2,
+         11,
+         f_sizeText(
+              positionSizingMode,
+              calculatedShortLotSize,
+              calculatedShortCashAmount
+         )
+    )
+
+    table.cell(dashboard, 0, 12, "Order Quantity")
+    table.cell(
+         dashboard,
+         1,
+         12,
+         str.tostring(
+              calculatedLongQuantity,
+              "#.######"
+         )
+    )
+    table.cell(
+         dashboard,
+         2,
+         12,
+         str.tostring(
+              calculatedShortQuantity,
+              "#.######"
+         )
+    )
+
+    table.cell(dashboard, 0, 13, "Quantity Valid")
+    table.cell(
+         dashboard,
+         1,
+         13,
+         f_yesNo(longQuantityIsValid)
+    )
+    table.cell(
+         dashboard,
+         2,
+         13,
+         f_yesNo(shortQuantityIsValid)
+    )
+
+    table.cell(dashboard, 0, 14, "Active Size")
+    table.cell(
+         dashboard,
+         1,
+         14,
+         strategy.position_size > 0
+         ? (
+              activeSizingMode == "Lots"
+              ? str.tostring(
+                   activeSizingValue,
+                   "#.##"
+              ) +
+                " Lots"
+              : "$" +
+                str.tostring(
+                     activeSizingValue,
+                     "#.##"
+                )
+         )
+         : "-"
+    )
+    table.cell(
+         dashboard,
+         2,
+         14,
+         strategy.position_size < 0
+         ? (
+              activeSizingMode == "Lots"
+              ? str.tostring(
+                   activeSizingValue,
+                   "#.##"
+              ) +
+                " Lots"
+              : "$" +
+                str.tostring(
+                     activeSizingValue,
+                     "#.##"
+                )
+         )
+         : "-"
+    )
+
+    table.cell(dashboard, 0, 15, "Active Order Qty")
+    table.cell(
+         dashboard,
+         1,
+         15,
+         strategy.position_size > 0
+         ? str.tostring(
+              activeOrderQuantity,
+              "#.######"
+         )
+         : "-"
+    )
+    table.cell(
+         dashboard,
+         2,
+         15,
+         strategy.position_size < 0
+         ? str.tostring(
+              activeOrderQuantity,
+              "#.######"
+         )
+         : "-"
+    )
+
+    table.cell(dashboard, 0, 16, "Selected RSI Mode")
+    table.cell(
+         dashboard,
+         1,
+         16,
+         useConfirmedLevelRsi
+         ? "Confirmed"
+         : "Live"
+    )
+    table.cell(
+         dashboard,
+         2,
+         16,
+         useConfirmedLevelRsi
+         ? "Confirmed"
+         : "Live"
+    )
+
+    table.cell(dashboard, 0, 17, "Bonus Switches")
+    table.cell(
+         dashboard,
+         1,
+         17,
+         "C:" +
+         (
+              enableChartRsiBonus
+              ? "ON"
+              : "OFF"
+         ) +
+         " R:" +
+         (
+              enableSelectedRsiBonus
+              ? "ON"
+              : "OFF"
+         ) +
+         " S:" +
+         (
+              enableSupertrendBonus
+              ? "ON"
+              : "OFF"
+         )
+    )
+    table.cell(
+         dashboard,
+         2,
+         17,
+         "C:" +
+         (
+              enableChartRsiBonus
+              ? "ON"
+              : "OFF"
+         ) +
+         " R:" +
+         (
+              enableSelectedRsiBonus
+              ? "ON"
+              : "OFF"
+         ) +
+         " S:" +
+         (
+              enableSupertrendBonus
+              ? "ON"
+              : "OFF"
+         )
+    )
+
+    table.cell(dashboard, 0, 18, "HTF Stoch TF")
+    table.cell(
+         dashboard,
+         1,
+         18,
+         htfStochTimeframe
+    )
+    table.cell(
+         dashboard,
+         2,
+         18,
+         htfStochTimeframe
+    )
+
+    table.cell(dashboard, 0, 19, "HTF Stoch K / D")
+    table.cell(
+         dashboard,
+         1,
+         19,
+         str.tostring(
+              htfStochK,
+              "#.##"
+         ) +
+         " / " +
+         str.tostring(
+              htfStochD,
+              "#.##"
+         )
+    )
+    table.cell(
+         dashboard,
+         2,
+         19,
+         str.tostring(
+              htfStochK,
+              "#.##"
+         ) +
+         " / " +
+         str.tostring(
+              htfStochD,
+              "#.##"
+         )
+    )
+
+    table.cell(dashboard, 0, 20, "HTF Extreme")
+    table.cell(
+         dashboard,
+         1,
+         20,
+         htfStochAboveOverbought
+         ? "Above 80"
+         : "No"
+    )
+    table.cell(
+         dashboard,
+         2,
+         20,
+         htfStochBelowOversold
+         ? "Below 20"
+         : "No"
+    )
+
+    table.cell(dashboard, 0, 21, "HTF Cross")
+    table.cell(
+         dashboard,
+         1,
+         21,
+         htfStochCrossingDown
+         ? "Cross Down"
+         : "No"
+    )
+    table.cell(
+         dashboard,
+         2,
+         21,
+         htfStochCrossingUp
+         ? "Cross Up"
+         : "No"
+    )
+
+    table.cell(dashboard, 0, 22, "HTF Entry Filter")
+    table.cell(
+         dashboard,
+         1,
+         22,
+         htfLongFilterPass
+         ? "PASS"
+         : "BLOCK"
+    )
+    table.cell(
+         dashboard,
+         2,
+         22,
+         htfShortFilterPass
+         ? "PASS"
+         : "BLOCK"
+    )
+
+    table.cell(dashboard, 0, 23, "HTF Stoch Mode")
+    table.cell(
+         dashboard,
+         1,
+         23,
+         useConfirmedHtfStoch
+         ? "Confirmed"
+         : "Live"
+    )
+    table.cell(
+         dashboard,
+         2,
+         23,
+         useConfirmedHtfStoch
+         ? "Confirmed"
+         : "Live"
+    )
+
+    table.cell(dashboard, 0, 24, "HTF RSI TF")
+    table.cell(
+         dashboard,
+         1,
+         24,
+         entryRsiTimeframe
+    )
+    table.cell(
+         dashboard,
+         2,
+         24,
+         entryRsiTimeframe
+    )
+
+    table.cell(dashboard, 0, 25, "HTF RSI")
+    table.cell(
+         dashboard,
+         1,
+         25,
+         str.tostring(
+              entryRsi,
+              "#.##"
+         )
+    )
+    table.cell(
+         dashboard,
+         2,
+         25,
+         str.tostring(
+              entryRsi,
+              "#.##"
+         )
+    )
+
+    table.cell(dashboard, 0, 26, "Required RSI Range")
+    table.cell(
+         dashboard,
+         1,
+         26,
+         "> " +
+         str.tostring(
+              entryRsiMidpoint,
+              "#.##"
+         ) +
+         " and < " +
+         str.tostring(
+              entryRsiUpperLimit,
+              "#.##"
+         )
+    )
+    table.cell(
+         dashboard,
+         2,
+         26,
+         "> " +
+         str.tostring(
+              entryRsiLowerLimit,
+              "#.##"
+         ) +
+         " and < " +
+         str.tostring(
+              entryRsiMidpoint,
+              "#.##"
+         )
+    )
+
+    table.cell(dashboard, 0, 27, "HTF RSI Entry Filter")
+    table.cell(
+         dashboard,
+         1,
+         27,
+         htfRsiLongFilterPass
+         ? "PASS"
+         : "BLOCK"
+    )
+    table.cell(
+         dashboard,
+         2,
+         27,
+         htfRsiShortFilterPass
+         ? "PASS"
+         : "BLOCK"
+    )
+
+    table.cell(dashboard, 0, 28, "HTF RSI Mode")
+    table.cell(
+         dashboard,
+         1,
+         28,
+         useConfirmedEntryRsi
+         ? "Confirmed"
+         : "Live"
+    )
+    table.cell(
+         dashboard,
+         2,
+         28,
+         useConfirmedEntryRsi
+         ? "Confirmed"
+         : "Live"
+    )
+
+    table.cell(dashboard, 0, 29, "HTF MACD Filter")
+    table.cell(
+         dashboard,
+         1,
+         29,
+         enableHtfMacdFilter
+         ? "ON"
+         : "OFF"
+    )
+    table.cell(
+         dashboard,
+         2,
+         29,
+         enableHtfMacdFilter
+         ? "ON"
+         : "OFF"
+    )
+
+    table.cell(dashboard, 0, 30, "HTF MACD TF")
+    table.cell(
+         dashboard,
+         1,
+         30,
+         htfMacdTimeframe
+    )
+    table.cell(
+         dashboard,
+         2,
+         30,
+         htfMacdTimeframe
+    )
+
+    table.cell(dashboard, 0, 31, "MACD / Signal")
+    table.cell(
+         dashboard,
+         1,
+         31,
+         str.tostring(
+              htfMacdLine,
+              "#.#####"
+         ) +
+         " / " +
+         str.tostring(
+              htfMacdSignal,
+              "#.#####"
+         )
+    )
+    table.cell(
+         dashboard,
+         2,
+         31,
+         str.tostring(
+              htfMacdLine,
+              "#.#####"
+         ) +
+         " / " +
+         str.tostring(
+              htfMacdSignal,
+              "#.#####"
+         )
+    )
+
+    table.cell(dashboard, 0, 32, "HTF MACD Entry")
+    table.cell(
+         dashboard,
+         1,
+         32,
+         not enableHtfMacdFilter
+         ? "OFF"
+         : htfMacdLongConfirmation
+           ? "PASS"
+           : "BLOCK"
+    )
+    table.cell(
+         dashboard,
+         2,
+         32,
+         not enableHtfMacdFilter
+         ? "OFF"
+         : htfMacdShortConfirmation
+           ? "PASS"
+           : "BLOCK"
+    )
