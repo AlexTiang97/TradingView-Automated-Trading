@@ -13,7 +13,7 @@ strategy(
 // STRATEGY STRUCTURE
 // ENTRY:
 // EMA trend
-// + Stoch trigger (%K crosses above 25 / below 75)
+// + Stoch trigger, then %K crosses 25 (buy) / 75 (sell)
 // + HTF Stoch protection
 // + HTF RSI momentum
 //
@@ -256,9 +256,6 @@ stochDSmoothing = input.int(
      group = "2. Stochastic RSI Entry"
 )
 
-// Oversold / Overbought are still used by the HTF Stoch RSI
-// entry filter and the pane zones. They no longer drive the
-// chart-timeframe trigger; see the trigger levels below.
 stochOversold = input.float(
      20.0,
      "Oversold Level",
@@ -275,26 +272,28 @@ stochOverbought = input.float(
      group = "2. Stochastic RSI Entry"
 )
 
-stochBuyTriggerLevel = input.float(
+stochBuyConfirmLevel = input.float(
      25.0,
-     "Buy Trigger — %K Crosses Above",
+     "Buy Confirmation — %K Crosses Above",
      minval = 0.0,
      maxval = 100.0,
      group = "2. Stochastic RSI Entry",
      tooltip =
-          "A buy trigger fires on the bar where the chart-timeframe " +
-          "Stoch RSI %K crosses above this level."
+          "After a buy trigger (%K crosses above %D below the oversold " +
+          "level), the buy entry happens on the bar where %K crosses " +
+          "above this level."
 )
 
-stochSellTriggerLevel = input.float(
+stochSellConfirmLevel = input.float(
      75.0,
-     "Sell Trigger — %K Crosses Below",
+     "Sell Confirmation — %K Crosses Below",
      minval = 0.0,
      maxval = 100.0,
      group = "2. Stochastic RSI Entry",
      tooltip =
-          "A sell trigger fires on the bar where the chart-timeframe " +
-          "Stoch RSI %K crosses below this level."
+          "After a sell trigger (%K crosses below %D above the overbought " +
+          "level), the sell entry happens on the bar where %K crosses " +
+          "below this level."
 )
 
 // Calculate Stochastic RSI.
@@ -343,20 +342,81 @@ stochD =
      )
 
 // Buy trigger:
-// %K crosses above the buy trigger level (default 25).
+// %K crosses above %D while both are below the oversold level.
 stochBuyTrigger =
      ta.crossover(
           stochK,
-          stochBuyTriggerLevel
-     )
+          stochD
+     ) and
+     stochK < stochOversold and
+     stochD < stochOversold
 
 // Sell trigger:
-// %K crosses below the sell trigger level (default 75).
+// %K crosses below %D while both are above the overbought level.
 stochSellTrigger =
      ta.crossunder(
           stochK,
-          stochSellTriggerLevel
+          stochD
+     ) and
+     stochK > stochOverbought and
+     stochD > stochOverbought
+
+// Level-cross confirmation.
+//
+// The trigger above (%K below 20) and the level cross (%K above 25)
+// cannot happen on the same bar, so they work in sequence:
+// 1. A buy trigger arms a buy setup.
+// 2. The buy is confirmed on the first later bar where %K crosses
+//    above the buy confirmation level (default 25).
+// 3. The setup is used up on that bar, whether or not the other
+//    entry filters pass. An opposite trigger also cancels it.
+//
+// Sell is the mirror: sell trigger arms, %K crossing below the
+// sell confirmation level (default 75) confirms.
+var bool stochBuySetupArmed = false
+var bool stochSellSetupArmed = false
+
+stochBuySetupActive =
+     stochBuyTrigger or
+     (
+          stochBuySetupArmed and
+          not stochSellTrigger
      )
+
+stochSellSetupActive =
+     stochSellTrigger or
+     (
+          stochSellSetupArmed and
+          not stochBuyTrigger
+     )
+
+stochBuyLevelCross =
+     ta.crossover(
+          stochK,
+          stochBuyConfirmLevel
+     )
+
+stochSellLevelCross =
+     ta.crossunder(
+          stochK,
+          stochSellConfirmLevel
+     )
+
+stochBuyConfirmed =
+     stochBuySetupActive and
+     stochBuyLevelCross
+
+stochSellConfirmed =
+     stochSellSetupActive and
+     stochSellLevelCross
+
+stochBuySetupArmed :=
+     stochBuySetupActive and
+     not stochBuyLevelCross
+
+stochSellSetupArmed :=
+     stochSellSetupActive and
+     not stochSellLevelCross
 
 //=====================================================================
 // 3. CHART RSI BONUS
@@ -1024,22 +1084,23 @@ htfMacdShortFilterPass =
 // A trade opens only when all original checks pass.
 // When the HTF MACD switch is ON, MACD becomes a fifth requirement:
 // 1. Three-EMA alignment.
-// 2. Chart-timeframe Stoch RSI %K crossing the trigger level
-//    (above 25 for buys, below 75 for sells).
+// 2. Chart-timeframe Stoch RSI cross, followed by %K crossing the
+//    confirmation level (above 25 for buys, below 75 for sells).
+//    The entry is taken on the level-cross bar.
 // 3. Higher-timeframe Stoch RSI requirement.
 // 4. Higher-timeframe RSI range requirement.
 // 5. Higher-timeframe MACD confirmation, when enabled.
 
 longEntryCondition =
      emaBuyCondition and
-     stochBuyTrigger and
+     stochBuyConfirmed and
      htfLongFilterPass and
      htfRsiLongFilterPass and
      htfMacdLongFilterPass
 
 shortEntryCondition =
      emaSellCondition and
-     stochSellTrigger and
+     stochSellConfirmed and
      htfShortFilterPass and
      htfRsiShortFilterPass and
      htfMacdShortFilterPass
@@ -1617,17 +1678,17 @@ stochLowerBoundary =
           color = color.new(color.gray, 100)
      )
 
-// Trigger levels used by the chart-timeframe entry trigger.
+// Confirmation levels used by the chart-timeframe entry.
 hline(
-     stochSellTriggerLevel,
-     "Stoch RSI Sell Trigger Level",
+     stochSellConfirmLevel,
+     "Stoch RSI Sell Confirmation Level",
      color = color.new(color.red, 40),
      linestyle = hline.style_dotted
 )
 
 hline(
-     stochBuyTriggerLevel,
-     "Stoch RSI Buy Trigger Level",
+     stochBuyConfirmLevel,
+     "Stoch RSI Buy Confirmation Level",
      color = color.new(color.green, 40),
      linestyle = hline.style_dotted
 )
@@ -1670,6 +1731,29 @@ plotshape(
      color = color.red,
      text = "S",
      textcolor = color.white,
+     size = size.tiny
+)
+
+// Mark the level-cross confirmations that complete an armed setup.
+plotshape(
+     stochBuyConfirmed
+     ? stochK
+     : na,
+     title = "Stoch RSI Buy Confirmation",
+     style = shape.circle,
+     location = location.absolute,
+     color = color.lime,
+     size = size.tiny
+)
+
+plotshape(
+     stochSellConfirmed
+     ? stochK
+     : na,
+     title = "Stoch RSI Sell Confirmation",
+     style = shape.circle,
+     location = location.absolute,
+     color = color.red,
      size = size.tiny
 )
 
@@ -1950,7 +2034,7 @@ var table dashboard =
      table.new(
           position.top_right,
           3,
-          33,
+          34,
           border_width = 1,
           force_overlay = true
      )
@@ -2633,4 +2717,26 @@ if barstate.islast
          : htfMacdShortConfirmation
            ? "PASS"
            : "BLOCK"
+    )
+
+    table.cell(dashboard, 0, 33, "Stoch Level Cross")
+    table.cell(
+         dashboard,
+         1,
+         33,
+         stochBuyConfirmed
+         ? "Crossed > " + str.tostring(stochBuyConfirmLevel, "#.##")
+         : stochBuySetupArmed
+           ? "Armed, wait > " + str.tostring(stochBuyConfirmLevel, "#.##")
+           : "No setup"
+    )
+    table.cell(
+         dashboard,
+         2,
+         33,
+         stochSellConfirmed
+         ? "Crossed < " + str.tostring(stochSellConfirmLevel, "#.##")
+         : stochSellSetupArmed
+           ? "Armed, wait < " + str.tostring(stochSellConfirmLevel, "#.##")
+           : "No setup"
     )
