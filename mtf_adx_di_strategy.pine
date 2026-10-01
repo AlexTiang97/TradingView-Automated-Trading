@@ -1,0 +1,332 @@
+//@version=6
+strategy(
+     "MTF ADX + DI Trend Strategy",
+     overlay = true,
+     pyramiding = 0,
+     initial_capital = 100000,
+     currency = currency.USD,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 10,
+     process_orders_on_close = false
+)
+
+//=====================================================================
+// STRATEGY STRUCTURE
+// Tracks ADX, +DI and -DI on three user-selected timeframes.
+//
+// Each timeframe is classified as:
+//   BULLISH : +DI > -DI and ADX >= threshold
+//   BEARISH : -DI > +DI and ADX >= threshold
+//   NEUTRAL : ADX below threshold (no trend strength)
+//
+// ENTRY:
+//   Long  when the required number of timeframes turn BULLISH
+//   Short when the required number of timeframes turn BEARISH
+//
+// EXIT:
+//   Opposite signal
+//   + optional exit when alignment is lost
+//   + optional fixed % TP / SL
+//=====================================================================
+
+//---------------------------------------------------------------------
+// INPUTS — TIMEFRAMES
+//---------------------------------------------------------------------
+const string GRP_TF = "Timeframes"
+
+tf1 = input.timeframe(
+     "15", "Timeframe 1",
+     options = ["1", "3", "5", "15", "30", "45", "60", "120", "180", "240", "360", "720", "D", "W", "M"],
+     group = GRP_TF)
+tf2 = input.timeframe(
+     "60", "Timeframe 2",
+     options = ["1", "3", "5", "15", "30", "45", "60", "120", "180", "240", "360", "720", "D", "W", "M"],
+     group = GRP_TF)
+tf3 = input.timeframe(
+     "240", "Timeframe 3",
+     options = ["1", "3", "5", "15", "30", "45", "60", "120", "180", "240", "360", "720", "D", "W", "M"],
+     group = GRP_TF)
+
+useConfirmed = input.bool(
+     true, "Use confirmed (closed) timeframe bars",
+     tooltip = "ON: uses the last CLOSED bar of each timeframe, so values never repaint. "
+          + "OFF: uses the still-forming bar (updates live, but historical results repaint).",
+     group = GRP_TF)
+
+//---------------------------------------------------------------------
+// INPUTS — ADX / DI
+//---------------------------------------------------------------------
+const string GRP_ADX = "ADX / DI Settings"
+
+diLength = input.int(14, "DI Length", minval = 1, group = GRP_ADX)
+adxSmoothing = input.int(14, "ADX Smoothing", minval = 1, group = GRP_ADX)
+adxThreshold = input.float(
+     20.0, "ADX Trend Threshold", minval = 0, step = 0.5,
+     tooltip = "ADX must be at or above this level for a timeframe to count as Bullish/Bearish.",
+     group = GRP_ADX)
+requireAdxRising = input.bool(
+     false, "Require ADX rising",
+     tooltip = "When ON, ADX must also be higher than its previous bar on that timeframe.",
+     group = GRP_ADX)
+
+//---------------------------------------------------------------------
+// INPUTS — STRATEGY
+//---------------------------------------------------------------------
+const string GRP_STRAT = "Strategy"
+
+tradeDirection = input.string(
+     "Both", "Trade Direction",
+     options = ["Both", "Long Only", "Short Only"],
+     group = GRP_STRAT)
+alignmentMode = input.string(
+     "All 3", "Required Alignment",
+     options = ["All 3", "Any 2 of 3"],
+     group = GRP_STRAT)
+exitOnAlignmentLoss = input.bool(
+     true, "Exit when alignment is lost",
+     tooltip = "Close the position as soon as the required number of timeframes no longer agree.",
+     group = GRP_STRAT)
+useTpSl = input.bool(false, "Use fixed TP / SL", group = GRP_STRAT)
+takeProfitPct = input.float(3.0, "Take Profit %", minval = 0.01, step = 0.1, group = GRP_STRAT)
+stopLossPct = input.float(1.5, "Stop Loss %", minval = 0.01, step = 0.1, group = GRP_STRAT)
+
+//---------------------------------------------------------------------
+// INPUTS — TABLE
+//---------------------------------------------------------------------
+const string GRP_TABLE = "Dashboard Table"
+
+showTable = input.bool(true, "Show Table", group = GRP_TABLE)
+tablePosition = input.string(
+     "Top Right", "Table Position",
+     options = ["Top Left", "Top Center", "Top Right",
+                "Middle Left", "Middle Right",
+                "Bottom Left", "Bottom Center", "Bottom Right"],
+     group = GRP_TABLE)
+tableTextSize = input.string(
+     "Normal", "Text Size",
+     options = ["Tiny", "Small", "Normal", "Large"],
+     group = GRP_TABLE)
+bullColor = input.color(#089981, "Bullish Color", group = GRP_TABLE)
+bearColor = input.color(#F23645, "Bearish Color", group = GRP_TABLE)
+neutralColor = input.color(#787B86, "Neutral Color", group = GRP_TABLE)
+showSignals = input.bool(true, "Show entry signal markers", group = GRP_TABLE)
+
+//---------------------------------------------------------------------
+// HELPERS
+//---------------------------------------------------------------------
+// Readable timeframe label: "15" -> "15m", "60" -> "1H", "D" -> "1D".
+f_tfLabel(string tf) =>
+    string result = tf
+    float minutes = str.tonumber(tf)
+    if not na(minutes)
+        result := minutes >= 60 and minutes % 60 == 0
+             ? str.tostring(minutes / 60, "#") + "H"
+             : str.tostring(minutes, "#") + "m"
+    else if str.length(tf) == 1
+        result := "1" + tf
+    result
+
+// ADX / DI values, optionally shifted to the last closed bar.
+f_dmi(int diLen, int adxLen, bool confirmed) =>
+    [plusDI, minusDI, adxValue] = ta.dmi(diLen, adxLen)
+    int offset = confirmed ? 1 : 0
+    [plusDI[offset], minusDI[offset], adxValue[offset], adxValue[offset + 1]]
+
+f_requestDmi(string tf) =>
+    request.security(
+         syminfo.tickerid, tf,
+         f_dmi(diLength, adxSmoothing, useConfirmed),
+         lookahead = useConfirmed ? barmerge.lookahead_on : barmerge.lookahead_off)
+
+// 1 = bullish, -1 = bearish, 0 = neutral.
+f_trendState(float plusDI, float minusDI, float adxValue, float adxPrev) =>
+    bool hasData = not na(plusDI) and not na(minusDI) and not na(adxValue)
+    bool strong = hasData
+         and adxValue >= adxThreshold
+         and (not requireAdxRising or adxValue > nz(adxPrev, adxValue))
+    strong and plusDI > minusDI ? 1 : strong and minusDI > plusDI ? -1 : 0
+
+f_stateText(int state) =>
+    state == 1 ? "BULLISH" : state == -1 ? "BEARISH" : "NEUTRAL"
+
+f_stateColor(int state) =>
+    state == 1 ? bullColor : state == -1 ? bearColor : neutralColor
+
+f_tablePosition(string pos) =>
+    switch pos
+        "Top Left"      => position.top_left
+        "Top Center"    => position.top_center
+        "Top Right"     => position.top_right
+        "Middle Left"   => position.middle_left
+        "Middle Right"  => position.middle_right
+        "Bottom Left"   => position.bottom_left
+        "Bottom Center" => position.bottom_center
+        => position.bottom_right
+
+f_textSize(string s) =>
+    switch s
+        "Tiny"  => size.tiny
+        "Small" => size.small
+        "Large" => size.large
+        => size.normal
+
+//---------------------------------------------------------------------
+// MULTI-TIMEFRAME ADX / DI
+//---------------------------------------------------------------------
+[plusDI1, minusDI1, adx1, adxPrev1] = f_requestDmi(tf1)
+[plusDI2, minusDI2, adx2, adxPrev2] = f_requestDmi(tf2)
+[plusDI3, minusDI3, adx3, adxPrev3] = f_requestDmi(tf3)
+
+int state1 = f_trendState(plusDI1, minusDI1, adx1, adxPrev1)
+int state2 = f_trendState(plusDI2, minusDI2, adx2, adxPrev2)
+int state3 = f_trendState(plusDI3, minusDI3, adx3, adxPrev3)
+
+int bullCount = (state1 == 1 ? 1 : 0) + (state2 == 1 ? 1 : 0) + (state3 == 1 ? 1 : 0)
+int bearCount = (state1 == -1 ? 1 : 0) + (state2 == -1 ? 1 : 0) + (state3 == -1 ? 1 : 0)
+int requiredCount = alignmentMode == "All 3" ? 3 : 2
+
+bool bullAligned = bullCount >= requiredCount
+bool bearAligned = bearCount >= requiredCount
+
+int overallState = bullAligned ? 1 : bearAligned ? -1 : 0
+
+//---------------------------------------------------------------------
+// ENTRIES / EXITS
+//---------------------------------------------------------------------
+bool allowLong = tradeDirection != "Short Only"
+bool allowShort = tradeDirection != "Long Only"
+
+bool longSignal = bullAligned and not bullAligned[1]
+bool shortSignal = bearAligned and not bearAligned[1]
+
+// Enter only on a fresh alignment so a TP/SL exit is not re-entered
+// immediately on the next bar.
+bool enterLong = longSignal and allowLong
+bool enterShort = shortSignal and allowShort
+
+// strategy.entry() reverses an open opposite position automatically.
+if enterLong and strategy.position_size <= 0
+    strategy.entry("Long", strategy.long, comment = "MTF Bull")
+else if enterShort and strategy.position_size >= 0
+    strategy.entry("Short", strategy.short, comment = "MTF Bear")
+
+// Flatten when alignment is lost, or when the opposite alignment
+// appears but that direction is disabled (so no reversal happens).
+if strategy.position_size > 0 and not bullAligned and not enterShort
+     and (exitOnAlignmentLoss or bearAligned)
+    strategy.close("Long", comment = bearAligned ? "Bear Align" : "Align Lost")
+if strategy.position_size < 0 and not bearAligned and not enterLong
+     and (exitOnAlignmentLoss or bullAligned)
+    strategy.close("Short", comment = bullAligned ? "Bull Align" : "Align Lost")
+
+if useTpSl and strategy.position_size > 0
+    float entryPrice = strategy.position_avg_price
+    strategy.exit(
+         "Long TP/SL", "Long",
+         limit = entryPrice * (1 + takeProfitPct / 100),
+         stop = entryPrice * (1 - stopLossPct / 100))
+if useTpSl and strategy.position_size < 0
+    float entryPrice = strategy.position_avg_price
+    strategy.exit(
+         "Short TP/SL", "Short",
+         limit = entryPrice * (1 - takeProfitPct / 100),
+         stop = entryPrice * (1 + stopLossPct / 100))
+
+//---------------------------------------------------------------------
+// CHART VISUALS
+//---------------------------------------------------------------------
+plotshape(
+     showSignals and longSignal, "Bullish Alignment",
+     shape.triangleup, location.belowbar, bullColor, size = size.small)
+plotshape(
+     showSignals and shortSignal, "Bearish Alignment",
+     shape.triangledown, location.abovebar, bearColor, size = size.small)
+
+//---------------------------------------------------------------------
+// ALERTS (in addition to the strategy's order-fill alerts)
+//---------------------------------------------------------------------
+if longSignal
+    alert("MTF ADX/DI: " + syminfo.ticker + " turned BULLISH", alert.freq_once_per_bar_close)
+if shortSignal
+    alert("MTF ADX/DI: " + syminfo.ticker + " turned BEARISH", alert.freq_once_per_bar_close)
+
+//---------------------------------------------------------------------
+// DASHBOARD TABLE
+//---------------------------------------------------------------------
+var table dashboard = table.new(
+     f_tablePosition(tablePosition), 5, 6,
+     bgcolor = color.new(color.black, 20),
+     border_color = color.new(color.gray, 60),
+     border_width = 1,
+     frame_color = color.new(color.gray, 40),
+     frame_width = 1)
+
+f_headerCell(int col, string txt, string textSz) =>
+    table.cell(
+         dashboard, col, 0, txt,
+         text_color = color.white, text_size = textSz,
+         bgcolor = color.new(color.gray, 50))
+
+f_tfRow(int row, string tf, float plusDI, float minusDI, float adxValue, int state, string textSz) =>
+    color stateColor = f_stateColor(state)
+    table.cell(dashboard, 0, row, f_tfLabel(tf), text_color = color.white, text_size = textSz)
+    table.cell(
+         dashboard, 1, row, str.tostring(plusDI, "#.0"),
+         text_color = plusDI > minusDI ? bullColor : color.silver, text_size = textSz)
+    table.cell(
+         dashboard, 2, row, str.tostring(minusDI, "#.0"),
+         text_color = minusDI > plusDI ? bearColor : color.silver, text_size = textSz)
+    table.cell(
+         dashboard, 3, row, str.tostring(adxValue, "#.0"),
+         text_color = adxValue >= adxThreshold ? color.white : color.gray, text_size = textSz)
+    table.cell(
+         dashboard, 4, row, f_stateText(state),
+         text_color = color.white, text_size = textSz,
+         bgcolor = color.new(stateColor, 25))
+
+if showTable and barstate.isfirst
+    table.merge_cells(dashboard, 1, 4, 3, 4)
+    table.merge_cells(dashboard, 1, 5, 3, 5)
+
+if showTable and barstate.islast
+    sz = f_textSize(tableTextSize)
+
+    f_headerCell(0, "Timeframe", sz)
+    f_headerCell(1, "+DI", sz)
+    f_headerCell(2, "-DI", sz)
+    f_headerCell(3, "ADX", sz)
+    f_headerCell(4, "Trend", sz)
+
+    f_tfRow(1, tf1, plusDI1, minusDI1, adx1, state1, sz)
+    f_tfRow(2, tf2, plusDI2, minusDI2, adx2, state2, sz)
+    f_tfRow(3, tf3, plusDI3, minusDI3, adx3, state3, sz)
+
+    table.cell(dashboard, 0, 4, "Overall", text_color = color.white, text_size = sz)
+    table.cell(
+         dashboard, 1, 4,
+         str.tostring(bullCount) + " Bull / " + str.tostring(bearCount) + " Bear  (need "
+              + str.tostring(requiredCount) + ")",
+         text_color = color.silver, text_size = sz)
+    table.cell(
+         dashboard, 4, 4, f_stateText(overallState),
+         text_color = color.white, text_size = sz,
+         bgcolor = f_stateColor(overallState))
+
+    string positionText = strategy.position_size > 0
+         ? "LONG"
+         : strategy.position_size < 0
+           ? "SHORT"
+           : "FLAT"
+    color positionColor = strategy.position_size > 0
+         ? bullColor
+         : strategy.position_size < 0
+           ? bearColor
+           : neutralColor
+    table.cell(dashboard, 0, 5, "Position", text_color = color.white, text_size = sz)
+    table.cell(
+         dashboard, 1, 5, "ADX threshold " + str.tostring(adxThreshold, "#.#"),
+         text_color = color.silver, text_size = sz)
+    table.cell(
+         dashboard, 4, 5, positionText,
+         text_color = color.white, text_size = sz,
+         bgcolor = color.new(positionColor, 25))
