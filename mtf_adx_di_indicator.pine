@@ -1,17 +1,11 @@
 //@version=6
-strategy(
-     "MTF ADX + DI Trend Strategy",
-     overlay = true,
-     pyramiding = 0,
-     initial_capital = 100000,
-     currency = currency.USD,
-     default_qty_type = strategy.percent_of_equity,
-     default_qty_value = 10,
-     process_orders_on_close = false
+indicator(
+     "MTF ADX + DI Trend Dashboard",
+     overlay = true
 )
 
 //=====================================================================
-// STRATEGY STRUCTURE
+// MTF ADX + DI TREND DASHBOARD
 // Tracks ADX, +DI and -DI on three user-selected timeframes.
 //
 // Each timeframe is classified as:
@@ -19,14 +13,9 @@ strategy(
 //   BEARISH : -DI > +DI and ADX >= threshold
 //   NEUTRAL : ADX below threshold (no trend strength)
 //
-// ENTRY:
-//   Long  when the required number of timeframes turn BULLISH
-//   Short when the required number of timeframes turn BEARISH
-//
-// EXIT:
-//   Opposite signal
-//   + optional exit when alignment is lost
-//   + optional fixed % TP / SL
+// OVERALL:
+//   BULLISH / BEARISH when the required number of timeframes agree.
+//   Markers and alerts fire when the overall state turns.
 //=====================================================================
 
 //---------------------------------------------------------------------
@@ -70,25 +59,14 @@ requireAdxRising = input.bool(
      group = GRP_ADX)
 
 //---------------------------------------------------------------------
-// INPUTS — STRATEGY
+// INPUTS — ALIGNMENT
 //---------------------------------------------------------------------
-const string GRP_STRAT = "Strategy"
+const string GRP_ALIGN = "Alignment"
 
-tradeDirection = input.string(
-     "Both", "Trade Direction",
-     options = ["Both", "Long Only", "Short Only"],
-     group = GRP_STRAT)
 alignmentMode = input.string(
      "All 3", "Required Alignment",
      options = ["All 3", "Any 2 of 3"],
-     group = GRP_STRAT)
-exitOnAlignmentLoss = input.bool(
-     true, "Exit when alignment is lost",
-     tooltip = "Close the position as soon as the required number of timeframes no longer agree.",
-     group = GRP_STRAT)
-useTpSl = input.bool(false, "Use fixed TP / SL", group = GRP_STRAT)
-takeProfitPct = input.float(3.0, "Take Profit %", minval = 0.01, step = 0.1, group = GRP_STRAT)
-stopLossPct = input.float(1.5, "Stop Loss %", minval = 0.01, step = 0.1, group = GRP_STRAT)
+     group = GRP_ALIGN)
 
 //---------------------------------------------------------------------
 // INPUTS — TABLE
@@ -109,7 +87,7 @@ tableTextSize = input.string(
 bullColor = input.color(#089981, "Bullish Color", group = GRP_TABLE)
 bearColor = input.color(#F23645, "Bearish Color", group = GRP_TABLE)
 neutralColor = input.color(#787B86, "Neutral Color", group = GRP_TABLE)
-showSignals = input.bool(true, "Show entry signal markers", group = GRP_TABLE)
+showSignals = input.bool(true, "Show alignment signal markers", group = GRP_TABLE)
 
 //---------------------------------------------------------------------
 // HELPERS
@@ -191,46 +169,10 @@ bool bearAligned = bearCount >= requiredCount
 int overallState = bullAligned ? 1 : bearAligned ? -1 : 0
 
 //---------------------------------------------------------------------
-// ENTRIES / EXITS
+// SIGNALS
 //---------------------------------------------------------------------
-bool allowLong = tradeDirection != "Short Only"
-bool allowShort = tradeDirection != "Long Only"
-
 bool longSignal = bullAligned and not bullAligned[1]
 bool shortSignal = bearAligned and not bearAligned[1]
-
-// Enter only on a fresh alignment so a TP/SL exit is not re-entered
-// immediately on the next bar.
-bool enterLong = longSignal and allowLong
-bool enterShort = shortSignal and allowShort
-
-// strategy.entry() reverses an open opposite position automatically.
-if enterLong and strategy.position_size <= 0
-    strategy.entry("Long", strategy.long, comment = "MTF Bull")
-else if enterShort and strategy.position_size >= 0
-    strategy.entry("Short", strategy.short, comment = "MTF Bear")
-
-// Flatten when alignment is lost, or when the opposite alignment
-// appears but that direction is disabled (so no reversal happens).
-if strategy.position_size > 0 and not bullAligned and not enterShort
-     and (exitOnAlignmentLoss or bearAligned)
-    strategy.close("Long", comment = bearAligned ? "Bear Align" : "Align Lost")
-if strategy.position_size < 0 and not bearAligned and not enterLong
-     and (exitOnAlignmentLoss or bullAligned)
-    strategy.close("Short", comment = bullAligned ? "Bull Align" : "Align Lost")
-
-if useTpSl and strategy.position_size > 0
-    float entryPrice = strategy.position_avg_price
-    strategy.exit(
-         "Long TP/SL", "Long",
-         limit = entryPrice * (1 + takeProfitPct / 100),
-         stop = entryPrice * (1 - stopLossPct / 100))
-if useTpSl and strategy.position_size < 0
-    float entryPrice = strategy.position_avg_price
-    strategy.exit(
-         "Short TP/SL", "Short",
-         limit = entryPrice * (1 - takeProfitPct / 100),
-         stop = entryPrice * (1 + stopLossPct / 100))
 
 //---------------------------------------------------------------------
 // CHART VISUALS
@@ -243,8 +185,11 @@ plotshape(
      shape.triangledown, location.abovebar, bearColor, size = size.small)
 
 //---------------------------------------------------------------------
-// ALERTS (in addition to the strategy's order-fill alerts)
+// ALERTS
 //---------------------------------------------------------------------
+alertcondition(longSignal, "MTF Bullish Alignment", "MTF ADX/DI: {{ticker}} turned BULLISH")
+alertcondition(shortSignal, "MTF Bearish Alignment", "MTF ADX/DI: {{ticker}} turned BEARISH")
+
 if longSignal
     alert("MTF ADX/DI: " + syminfo.ticker + " turned BULLISH", alert.freq_once_per_bar_close)
 if shortSignal
@@ -286,7 +231,7 @@ f_tfRow(int row, string tf, float plusDI, float minusDI, float adxValue, int sta
 
 if showTable and barstate.isfirst
     table.merge_cells(dashboard, 1, 4, 3, 4)
-    table.merge_cells(dashboard, 1, 5, 3, 5)
+    table.merge_cells(dashboard, 1, 5, 4, 5)
 
 if showTable and barstate.islast
     sz = f_textSize(tableTextSize)
@@ -312,21 +257,8 @@ if showTable and barstate.islast
          text_color = color.white, text_size = sz,
          bgcolor = f_stateColor(overallState))
 
-    string positionText = strategy.position_size > 0
-         ? "LONG"
-         : strategy.position_size < 0
-           ? "SHORT"
-           : "FLAT"
-    color positionColor = strategy.position_size > 0
-         ? bullColor
-         : strategy.position_size < 0
-           ? bearColor
-           : neutralColor
-    table.cell(dashboard, 0, 5, "Position", text_color = color.white, text_size = sz)
+    table.cell(dashboard, 0, 5, "ADX Min", text_color = color.white, text_size = sz)
     table.cell(
-         dashboard, 1, 5, "ADX threshold " + str.tostring(adxThreshold, "#.#"),
+         dashboard, 1, 5, str.tostring(adxThreshold, "#.#")
+              + (requireAdxRising ? "  (rising required)" : ""),
          text_color = color.silver, text_size = sz)
-    table.cell(
-         dashboard, 4, 5, positionText,
-         text_color = color.white, text_size = sz,
-         bgcolor = color.new(positionColor, 25))
