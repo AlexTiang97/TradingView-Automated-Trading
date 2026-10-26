@@ -1,0 +1,1420 @@
+//@version=6
+strategy(
+     "Alex Forex Playbook — 9 Methods + Pre-Trade Checklist",
+     shorttitle = "Alex FX 9M",
+     overlay = true,
+     pyramiding = 0,
+     initial_capital = 10000,
+     currency = currency.USD,
+     default_qty_type = strategy.fixed,
+     process_orders_on_close = true,
+     margin_long = 2,
+     margin_short = 2,
+     max_labels_count = 500,
+     max_lines_count = 500
+)
+
+//=====================================================================
+// STRATEGY STRUCTURE
+// Built from the "alex-forex-trading" skill (Forex Trading Playbook:
+// 9 Analysis Methods). Designed for a 5-minute chart on majors and
+// XAUUSD (e.g. OANDA:EURUSD, OANDA:XAUUSD).
+//
+// BIAS (method 1, always on):
+// Daily structure / BOS + premium-discount of the daily dealing range
+// + weekly conflict check + draw on liquidity
+//
+// ENTRIES:
+// 2 · ICT killzone sweep → close back inside → 5m MSS → FVG limit (OTE)
+// 3 · ICT Silver Bullet: first 5m FVG in the window toward the draw
+// 4 · 4h trend + S/R zone + 1h pin bar / engulfing
+// 5 · 4h zone break + retest + 1h rejection
+// 6 · Range edge fade / false-breakout fade (1h)
+// 7 · EMA 9/21/200 pullback scalp (London / overlap)
+// 8 · London / NY opening-range breakout
+// 9 · VWAP + Bollinger mean reversion
+//
+// PRE-TRADE CHECKLIST (hard gates, any fail = no trade):
+// 1 premium/discount · 2 no 4h gap in the path · 3 daily + 4h agree
+// 4 setup fits regime · 5 1h confirmation (inside methods 4–6)
+// 6 minimum stop, widen never tighten · 7 closed-candle triggers
+// 8 one position · 9 news clear · 10 day / week loss limits + lot floor
+//
+// SIZE:
+// Risk % of equity (0.5% default, 1% for methods 2–6 after two
+// winners, 0.25% near the weekly stop), lots always rounded DOWN
+//
+// EXIT:
+// SL + TP1 (50%) + TP2, stop to entry at +1.5R or after TP1,
+// time stops for methods 8 and 9, pending orders expire
+//
+// NOT POSSIBLE IN PINE (handled by inputs instead):
+// economic calendar (manual / fixed release times), multi-pair scan,
+// reading your trade log (the strategy uses its own closed trades)
+//=====================================================================
+
+string NY  = "America/New_York"
+string LDN = "Europe/London"
+string BKK = "Asia/Bangkok"
+
+//=====================================================================
+// INPUTS
+//=====================================================================
+
+string GRP_RISK = "Account and risk"
+
+float riskBasePct = input.float(
+     0.5, "Risk per trade %", minval = 0.05, step = 0.05, group = GRP_RISK)
+float riskUpPct = input.float(
+     1.0, "Risk % after 2 winners (methods 2–6)", minval = 0.05, step = 0.05, group = GRP_RISK)
+float riskNearPct = input.float(
+     0.25, "Risk % near the weekly stop", minval = 0.05, step = 0.05, group = GRP_RISK)
+int dayMaxLosses = input.int(
+     3, "Day stop: losing trades", minval = 1, group = GRP_RISK)
+float dayMaxLossPct = input.float(
+     2.0, "Day stop: loss %", minval = 0.1, step = 0.1, group = GRP_RISK)
+float weekMaxLossPct = input.float(
+     3.0, "Weekly stop: loss %", minval = 0.1, step = 0.1, group = GRP_RISK)
+float nearWeekPct = input.float(
+     1.0, "Near weekly stop when within %", minval = 0.1, step = 0.1, group = GRP_RISK)
+int minScore = input.int(
+     5, "Minimum score (0–10)", minval = 0, maxval = 10, group = GRP_RISK)
+float unitsPerLotIn = input.float(
+     0, "Units per lot (0 = auto)", minval = 0, group = GRP_RISK,
+     tooltip = "Auto: forex 100,000 · XAU 100 · XAG 5,000 · other 1")
+float lotStep = input.float(
+     0.01, "Lot step / minimum lot", minval = 0.001, step = 0.01, group = GRP_RISK)
+
+string GRP_M = "Methods (method 1 bias always runs)"
+
+bool m2On = input.bool(true, "2 · ICT killzone sweep → MSS → FVG", group = GRP_M)
+bool m3On = input.bool(true, "3 · ICT Silver Bullet", group = GRP_M)
+bool m4On = input.bool(true, "4 · Zones + trend bounce", group = GRP_M)
+bool m5On = input.bool(true, "5 · Break and retest", group = GRP_M)
+bool m6On = input.bool(true, "6 · Range + false-breakout fade", group = GRP_M)
+bool m7On = input.bool(true, "7 · EMA 9/21/200 pullback scalp", group = GRP_M)
+bool m8On = input.bool(true, "8 · Opening-range breakout", group = GRP_M)
+bool m9On = input.bool(true, "9 · VWAP + Bollinger mean reversion", group = GRP_M)
+
+string GRP_C = "Pre-trade checklist (hard gates)"
+
+bool c1On = input.bool(true, "1 · Right half of the range (premium / discount)", group = GRP_C)
+bool c2On = input.bool(true, "2 · No 4h gap in the path (targets stop in front)", group = GRP_C)
+bool c3On = input.bool(true, "3 · Daily and 4h agree with the trade", group = GRP_C)
+bool c4On = input.bool(true, "4 · Setup fits the regime", group = GRP_C)
+bool c9On = input.bool(true, "9 · News clear", group = GRP_C)
+bool c10On = input.bool(true, "10 · Day / weekly loss limits", group = GRP_C)
+bool useRangeDay = input.bool(true, "Detect range days", group = GRP_C)
+float rangeDayAtr = input.float(
+     0.5, "Range day: day range ≤ × daily ATR", minval = 0.1, step = 0.05, group = GRP_C)
+float rangeDayHours = input.float(
+     8, "Range day: judged after N hours of the day", minval = 1, step = 1, group = GRP_C)
+
+string GRP_P = "Method settings"
+
+bool m2Ote = input.bool(true, "M2: FVG must overlap the 62–79% OTE", group = GRP_P)
+bool m2EntryMid = input.bool(false, "M2: enter at the FVG midpoint (else the near edge)", group = GRP_P)
+float m3MinFvg = input.float(2.5, "M3: minimum FVG size (pips)", minval = 0, step = 0.5, group = GRP_P)
+bool m5BigBody = input.bool(true, "M5: break candle body above average", group = GRP_P)
+float m6Flat = input.float(
+     0.1, "M6: flat 4h 50 EMA = 10-bar slope < × daily ATR", minval = 0.01, step = 0.01, group = GRP_P)
+float m7GapAtr = input.float(
+     0.15, "M7: min EMA 9–21 gap × 5m ATR", minval = 0, step = 0.05, group = GRP_P)
+int m7MaxTrades = input.int(6, "M7: max trades per day", minval = 1, group = GRP_P)
+float m8MinPips = input.float(8, "M8: min opening range (pips)", minval = 0, group = GRP_P)
+float m8MaxAtr = input.float(
+     0.3, "M8: max opening range × daily ATR", minval = 0.05, step = 0.05, group = GRP_P)
+float m8BufPips = input.float(1.5, "M8: breakout close beyond the range (pips)", minval = 0, step = 0.5, group = GRP_P)
+int m8Expiry = input.int(120, "M8: breakout must come within (min)", minval = 5, group = GRP_P)
+bool m8Against = input.bool(false, "M8: allow against the 1h trend at half size", group = GRP_P)
+int m8TimeStop = input.int(45, "M8: time stop if TP1 not hit (min)", minval = 5, group = GRP_P)
+int m9Crosses = input.int(3, "M9: min VWAP crosses in the last 3h", minval = 0, group = GRP_P)
+int m9TimeStop = input.int(30, "M9: time stop if TP1 not hit (min)", minval = 5, group = GRP_P)
+
+string GRP_N = "News (Pine cannot read the calendar)"
+
+bool news0830 = input.bool(false, "Treat 08:30 New York (Mon–Fri) as high impact", group = GRP_N)
+bool news1000 = input.bool(false, "Treat 10:00 New York (Mon–Fri) as high impact", group = GRP_N)
+bool newsManualOn = input.bool(false, "Use the event times below", group = GRP_N)
+int newsT1 = input.time(timestamp("2026-10-28T12:30+00:00"), "Event 1", group = GRP_N)
+int newsT2 = input.time(timestamp("2026-10-29T18:00+00:00"), "Event 2", group = GRP_N)
+int newsT3 = input.time(timestamp("2026-10-30T12:30+00:00"), "Event 3", group = GRP_N)
+string newsAction = input.string(
+     "Breakeven", "Open trade before a release", options = ["Breakeven", "Close", "Nothing"], group = GRP_N)
+
+string GRP_D = "Display"
+
+bool showLevels = input.bool(true, "Show bias levels (equilibrium, PDH/PDL, Asian range, VWAP)", group = GRP_D)
+bool showEmas = input.bool(false, "Show EMA 9 / 21 / 200", group = GRP_D)
+bool showWindows = input.bool(true, "Shade killzones", group = GRP_D)
+bool showTable = input.bool(true, "Show dashboard", group = GRP_D)
+bool showRejected = input.bool(false, "Label rejected setups with the failed rule", group = GRP_D)
+
+//=====================================================================
+// SYMBOL CONVENTIONS
+//=====================================================================
+
+bool isGold = str.contains(syminfo.ticker, "XAU")
+bool isSilver = str.contains(syminfo.ticker, "XAG")
+bool isJpy = syminfo.currency == "JPY"
+float pip = isGold ? 0.1 : isSilver ? 0.01 : isJpy ? 0.01 : 0.0001
+float unitsPerLot = unitsPerLotIn > 0
+     ? unitsPerLotIn
+     : isGold ? 100.0 : isSilver ? 5000.0 : syminfo.type == "forex" ? 100000.0 : 1.0
+
+//=====================================================================
+// HELPERS
+//=====================================================================
+
+f_inWin(string sess, string tz) =>
+    not na(time(timeframe.period, sess, tz))
+
+f_nyTs(int hh, int mm) =>
+    timestamp(NY, year(time, NY), month(time, NY), dayofmonth(time, NY), hh, mm)
+
+f_fmt(float v) =>
+    na(v) ? "—" : str.tostring(v, format.mintick)
+
+// Swing structure: last two swing highs / lows, trend and break of structure.
+f_structure(simple int k) =>
+    float ph = ta.pivothigh(high, k, k)
+    float pl = ta.pivotlow(low, k, k)
+    var float h1 = na
+    var float h2 = na
+    var float l1 = na
+    var float l2 = na
+    var int hCnt = 0
+    var int lCnt = 0
+    if not na(ph)
+        h2 := h1
+        h1 := ph
+        hCnt += 1
+    if not na(pl)
+        l2 := l1
+        l1 := pl
+        lCnt += 1
+    int trend = h1 > h2 and l1 > l2 ? 1 : h1 < h2 and l1 < l2 ? -1 : 0
+    int bos = close > h1 ? 1 : close < l1 ? -1 : 0
+    [trend, bos, h1, l1, hCnt, lCnt]
+
+// 1 bullish pin · -1 bearish pin · 2 bullish engulfing · -2 bearish engulfing
+f_pattern() =>
+    float rng = high - low
+    float bodyLo = math.min(open, close)
+    float bodyHi = math.max(open, close)
+    int pat = 0
+    if rng > 0
+        if bodyLo - low >= 2.0 / 3.0 * rng
+            pat := 1
+        else if high - bodyHi >= 2.0 / 3.0 * rng
+            pat := -1
+        else if close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
+            pat := 2
+        else if close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
+            pat := -2
+    pat
+
+// Nearest unfilled fair value gap above (its bottom) and below (its top).
+f_fvgNearest() =>
+    var array<float> gBot = array.new<float>()
+    var array<float> gTop = array.new<float>()
+    var array<int> gDir = array.new<int>()
+    if low > high[2]
+        array.push(gBot, high[2])
+        array.push(gTop, low)
+        array.push(gDir, 1)
+    if high < low[2]
+        array.push(gBot, high)
+        array.push(gTop, low[2])
+        array.push(gDir, -1)
+    int n = array.size(gBot)
+    if n > 0
+        for i = n - 1 to 0
+            bool filled = array.get(gDir, i) == 1
+                 ? low <= array.get(gBot, i)
+                 : high >= array.get(gTop, i)
+            if filled
+                array.remove(gBot, i)
+                array.remove(gTop, i)
+                array.remove(gDir, i)
+    while array.size(gBot) > 40
+        array.shift(gBot)
+        array.shift(gTop)
+        array.shift(gDir)
+    float above = na
+    float below = na
+    for [i, b] in gBot
+        float t = array.get(gTop, i)
+        if b > close and (na(above) or b < above)
+            above := b
+        if t < close and (na(below) or t > below)
+            below := t
+    [above, below]
+
+//=====================================================================
+// HIGHER-TIMEFRAME DATA (last closed bar only, no repainting)
+//=====================================================================
+
+f_daily() =>
+    [t2, b2, sh2, sl2, hc2, lc2] = f_structure(2)
+    [t3, b3, sh3, sl3, hc3, lc3] = f_structure(3)
+    float a = ta.atr(14)
+    [t2[1], b2[1], sh2[1], sl2[1], sh3[1], sl3[1], hc3[1], lc3[1], a[1], high[1], low[1]]
+
+f_weekly() =>
+    [t, b, sh, sl, hc, lc] = f_structure(2)
+    [t[1], high[1], low[1]]
+
+f_h4() =>
+    [t, b, sh, sl, hc, lc] = f_structure(3)
+    float e50 = ta.ema(close, 50)
+    float slope = e50 - e50[10]
+    [diPlus, diMinus, adxV] = ta.dmi(14, 14)
+    float bxHi = ta.highest(high, 40)[2]
+    float bxLo = ta.lowest(low, 40)[2]
+    int out2 = close > bxHi and close[1] > bxHi[1] ? 1 : close < bxLo and close[1] < bxLo[1] ? -1 : 0
+    float body = math.abs(close - open)
+    bool big = body > ta.sma(body, 20)
+    [fA, fB] = f_fvgNearest()
+    [t[1], sh[1], sl[1], hc[1], lc[1], e50[1], slope[1], adxV[1], bxHi[1], bxLo[1], out2[1], close[1], high[1], low[1], big[1], fA[1], fB[1], time[1]]
+
+f_h1() =>
+    [t, b, sh, sl, hc, lc] = f_structure(3)
+    int pat = f_pattern()
+    float e50 = ta.ema(close, 50)
+    [t[1], b[1], pat[1], open[1], high[1], low[1], close[1], e50[1], time[1]]
+
+[dTrendR, dBosR, dSwH, dSwL, drHi, drLo, dPhCnt, dPlCnt, atrD, pdh, pdl] = request.security(syminfo.tickerid, "D", f_daily(), lookahead = barmerge.lookahead_on)
+[wTrendR, pwh, pwl] = request.security(syminfo.tickerid, "W", f_weekly(), lookahead = barmerge.lookahead_on)
+[h4TrendR, h4SH, h4SL, h4Hc, h4Lc, h4E50, h4Slope, h4Adx, h4BxHi, h4BxLo, h4Out2R, h4C, h4H, h4L, h4Big, h4FvgA, h4FvgB, h4Time] = request.security(syminfo.tickerid, "240", f_h4(), lookahead = barmerge.lookahead_on)
+[h1TrendR, h1BosR, h1PatR, h1O, h1H, h1L, h1C, h1E50, h1Time] = request.security(syminfo.tickerid, "60", f_h1(), lookahead = barmerge.lookahead_on)
+
+int dTrend = nz(dTrendR)
+int dBos = nz(dBosR)
+int wTrend = nz(wTrendR)
+int h4T = nz(h4TrendR)
+int h4Out2 = nz(h4Out2R)
+int h1T = nz(h1TrendR)
+int h1Bos = nz(h1BosR)
+int h1Pat = nz(h1PatR)
+
+bool newH1 = not na(h1Time) and h1Time != nz(h1Time[1])
+bool newH4 = not na(h4Time) and h4Time != nz(h4Time[1])
+
+//=====================================================================
+// S/R ZONES (daily + 4h swing points clustered within 0.25 daily ATR)
+//=====================================================================
+
+var array<float> zonePts = array.new<float>()
+var array<float> zLo = array.new<float>()
+var array<float> zHi = array.new<float>()
+var array<int> zT = array.new<int>()
+var array<float> h4PvHi = array.new<float>()
+var array<int> h4PvHiT = array.new<int>()
+var array<float> h4PvLo = array.new<float>()
+var array<int> h4PvLoT = array.new<int>()
+
+bool ptsChanged = false
+if not na(dPhCnt) and dPhCnt != nz(dPhCnt[1]) and not na(drHi)
+    array.push(zonePts, drHi)
+    ptsChanged := true
+if not na(dPlCnt) and dPlCnt != nz(dPlCnt[1]) and not na(drLo)
+    array.push(zonePts, drLo)
+    ptsChanged := true
+if not na(h4Hc) and h4Hc != nz(h4Hc[1]) and not na(h4SH)
+    array.push(zonePts, h4SH)
+    array.push(h4PvHi, h4SH)
+    array.push(h4PvHiT, h4Time)
+    ptsChanged := true
+if not na(h4Lc) and h4Lc != nz(h4Lc[1]) and not na(h4SL)
+    array.push(zonePts, h4SL)
+    array.push(h4PvLo, h4SL)
+    array.push(h4PvLoT, h4Time)
+    ptsChanged := true
+while array.size(zonePts) > 80
+    array.shift(zonePts)
+while array.size(h4PvHi) > 60
+    array.shift(h4PvHi)
+    array.shift(h4PvHiT)
+while array.size(h4PvLo) > 60
+    array.shift(h4PvLo)
+    array.shift(h4PvLoT)
+
+f_addZone(array<float> cl, float atrDay) =>
+    if array.size(cl) >= 2
+        float lo = array.min(cl)
+        float hi = array.max(cl)
+        if hi - lo > 0.5 * atrDay
+            float mid = array.median(cl)
+            lo := mid - 0.25 * atrDay
+            hi := mid + 0.25 * atrDay
+        array.push(zLo, lo)
+        array.push(zHi, hi)
+        array.push(zT, array.size(cl))
+    true
+
+f_buildZones(float atrDay) =>
+    array.clear(zLo)
+    array.clear(zHi)
+    array.clear(zT)
+    if array.size(zonePts) >= 2 and not na(atrDay)
+        array<float> s = array.copy(zonePts)
+        array.sort(s, order.ascending)
+        float tol = 0.25 * atrDay
+        array<float> cur = array.new<float>()
+        for p in s
+            if array.size(cur) > 0 and p - array.get(cur, 0) > tol
+                f_addZone(cur, atrDay)
+                array.clear(cur)
+            array.push(cur, p)
+        f_addZone(cur, atrDay)
+    true
+
+if ptsChanged or atrD != atrD[1]
+    f_buildZones(atrD)
+
+// Major zone, or a minor one holding a round number or last week's high / low.
+f_zoneKey(int i) =>
+    float lo = array.get(zLo, i)
+    float hi = array.get(zHi, i)
+    float step = 100 * pip
+    float rn = math.round((lo + hi) / 2 / step) * step
+    bool hasLevel = (rn >= lo and rn <= hi) or (pwh >= lo and pwh <= hi) or (pwl >= lo and pwl <= hi)
+    array.get(zT, i) >= 3 or hasLevel
+
+// Edge of the next opposing zone beyond a price, minus a small buffer.
+f_nextZone(int dir, float fromPx) =>
+    float t = na
+    for [i, lo] in zLo
+        float hi = array.get(zHi, i)
+        if dir == 1 and lo > fromPx and (na(t) or lo < t)
+            t := lo
+        if dir == -1 and hi < fromPx and (na(t) or hi > t)
+            t := hi
+    na(t) ? na : t - dir * 0.02 * atrD
+
+// 4h history for break-and-retest and range touches (index 0 = oldest).
+var array<float> h4Cs = array.new<float>()
+var array<float> h4Hs = array.new<float>()
+var array<float> h4Ls = array.new<float>()
+var array<bool> h4Bigs = array.new<bool>()
+var array<int> h4Ts = array.new<int>()
+if newH4 and not na(h4C)
+    array.push(h4Cs, h4C)
+    array.push(h4Hs, h4H)
+    array.push(h4Ls, h4L)
+    array.push(h4Bigs, h4Big)
+    array.push(h4Ts, h4Time)
+    while array.size(h4Cs) > 41
+        array.shift(h4Cs)
+        array.shift(h4Hs)
+        array.shift(h4Ls)
+        array.shift(h4Bigs)
+        array.shift(h4Ts)
+
+//=====================================================================
+// 5-MINUTE INDICATORS
+//=====================================================================
+
+float ema9 = ta.ema(close, 9)
+float ema21 = ta.ema(close, 21)
+float ema200 = ta.ema(close, 200)
+float atr5 = ta.atr(14)
+float rsi7 = ta.rsi(close, 7)
+[bbMid, bbUp, bbLo] = ta.bb(close, 20, 2)
+float bbw = (bbUp - bbLo) / bbMid
+float bbwChg = 100 * (bbw / bbw[6] - 1)
+float lo5 = ta.lowest(low, 5)
+float hi5 = ta.highest(high, 5)
+float lo6 = ta.lowest(low, 6)
+float hi6 = ta.highest(high, 6)
+float touch9L = ta.highest(low <= ema9 ? 1 : 0, 6)
+float touch9S = ta.highest(high >= ema9 ? 1 : 0, 6)
+float brk21L = ta.highest(close < ema21 and close[1] < ema21[1] ? 1 : 0, 6)
+float brk21S = ta.highest(close > ema21 and close[1] > ema21[1] ? 1 : 0, 6)
+[m5T, m5B, m5SH, m5SL, m5Hc, m5Lc] = f_structure(3)
+bool bullFvgNow = low > high[2]
+bool bearFvgNow = high < low[2]
+
+// Minimum stop = max(2 × 5m ATR, 10% of daily ATR)
+float minStop = math.max(2 * atr5, 0.1 * atrD)
+
+//=====================================================================
+// SESSIONS (exchange-local times, so DST is handled automatically)
+//=====================================================================
+
+int nyDow = dayofweek(time, NY)
+bool inAsiaEve = f_inWin("2000-2359", NY)
+bool inAsiaSun = f_inWin("1700-2359", NY)
+bool inAsia = inAsiaEve or (nyDow == dayofweek.sunday and inAsiaSun)
+bool newDay = inAsia and not inAsia[1]
+
+bool inLkz = f_inWin("0200-0500", NY)
+bool inNykz = f_inWin("0700-1000", NY)
+bool inSb1 = f_inWin("0300-0400", NY)
+bool inSb2 = f_inWin("1000-1100", NY)
+bool inSb3 = f_inWin("1400-1500", NY)
+bool inOverlap = f_inWin("0800-1200", NY)
+bool inLonScalp = f_inWin("0800-1100", LDN)
+bool inLor = f_inWin("0800-0830", LDN)
+bool inNor = f_inWin("0930-0945", NY)
+bool inM9a = f_inWin("1100-1300", LDN)
+bool inM9b = f_inWin("1200-1400", NY)
+bool inBkkAsia = f_inWin("0700-1300", BKK)
+bool inKz = inLkz or inNykz
+bool inSb = inSb1 or inSb2 or inSb3
+bool inAnyWindow = inKz or inSb or inOverlap or inLonScalp or inLor or inNor or inM9a or inM9b
+
+// Session day (starts with the Asian range at 20:00 New York)
+var float dayHi = na
+var float dayLo = na
+var int dayStartT = na
+var int prevDayStartT = na
+var float asiaHi = na
+var float asiaLo = na
+var float lorHi = na
+var float lorLo = na
+var int lorStartT = na
+var int lorEndT = na
+var bool lorDone = false
+var bool lorTraded = false
+var float norHi = na
+var float norLo = na
+var int norStartT = na
+var int norEndT = na
+var bool norDone = false
+var bool norTraded = false
+var bool vwOn = false
+var float vwSum = 0.0
+var int vwN = 0
+
+bool newWeek = false
+if newDay
+    newWeek := nyDow == dayofweek.sunday or na(dayStartT) or time - dayStartT > 36 * 3600000
+    prevDayStartT := dayStartT
+    dayHi := high
+    dayLo := low
+    dayStartT := time
+    asiaHi := high
+    asiaLo := low
+    lorDone := false
+    lorTraded := false
+    norDone := false
+    norTraded := false
+    vwOn := false
+else
+    dayHi := na(dayHi) ? high : math.max(dayHi, high)
+    dayLo := na(dayLo) ? low : math.min(dayLo, low)
+    if inAsia and not na(asiaHi)
+        asiaHi := math.max(asiaHi, high)
+        asiaLo := math.min(asiaLo, low)
+bool asiaDone = not inAsia and not na(asiaHi)
+
+if inLor and not inLor[1]
+    lorHi := high
+    lorLo := low
+    lorStartT := time
+    vwOn := true
+    vwSum := 0.0
+    vwN := 0
+else if inLor
+    lorHi := math.max(lorHi, high)
+    lorLo := math.min(lorLo, low)
+if not inLor and inLor[1]
+    lorDone := true
+    lorEndT := time
+
+if inNor and not inNor[1]
+    norHi := high
+    norLo := low
+    norStartT := time
+else if inNor
+    norHi := math.max(norHi, high)
+    norLo := math.min(norLo, low)
+if not inNor and inNor[1]
+    norDone := true
+    norEndT := time
+
+// VWAP anchored at the London open (equal weights, as in the engine)
+if vwOn
+    vwSum += hlc3
+    vwN += 1
+float vwap = vwOn and vwN > 0 ? vwSum / vwN : na
+bool vwCross = not na(vwap) and not na(vwap[1])
+     and ((close > vwap and close[1] <= vwap[1]) or (close < vwap and close[1] >= vwap[1]))
+float vwCrossCnt = math.sum(vwCross ? 1 : 0, 36)
+
+float dayMid = (dayHi + dayLo) / 2
+bool rangeDay = useRangeDay and not na(dayStartT)
+     and time - dayStartT >= rangeDayHours * 3600000
+     and dayHi - dayLo <= rangeDayAtr * atrD
+
+//=====================================================================
+// METHOD 1 · HIGHER-TIMEFRAME BIAS AND DRAW ON LIQUIDITY
+//=====================================================================
+
+float eq = (drHi + drLo) / 2
+int dailyDir = dBos != 0 ? dBos : dTrend
+bool tfConflict = wTrend != 0 and dTrend != 0 and wTrend == -dTrend and dBos == 0
+int biasDir = tfConflict ? 0
+     : (dTrend == 1 or dBos == 1) and close < eq ? 1
+     : (dTrend == -1 or dBos == -1) and close > eq ? -1 : 0
+bool h4AgainstDaily = h4T != 0 and dailyDir != 0 and h4T == -dailyDir
+
+f_nearestAbove(float px, float a, float b, float c) =>
+    float best = na
+    if not na(a) and a > px
+        best := a
+    if not na(b) and b > px and (na(best) or b < best)
+        best := b
+    if not na(c) and c > px and (na(best) or c < best)
+        best := c
+    best
+
+f_nearestBelow(float px, float a, float b, float c) =>
+    float best = na
+    if not na(a) and a < px
+        best := a
+    if not na(b) and b < px and (na(best) or b > best)
+        best := b
+    if not na(c) and c < px and (na(best) or c > best)
+        best := c
+    best
+
+float drawUp = f_nearestAbove(close, pdh, pwh, dSwH)
+float drawDn = f_nearestBelow(close, pdl, pwl, dSwL)
+
+// Regime: 4h ADX < 20 or a range day → range-edge fades only
+bool rangeRegime = h4Adx < 20 or rangeDay
+
+f_atRangeEdge(float lvl) =>
+    float tol = 0.15 * atrD
+    bool box4h = math.abs(lvl - h4BxHi) <= tol or math.abs(lvl - h4BxLo) <= tol
+    bool boxDay = rangeDay and (math.abs(lvl - dayHi) <= tol or math.abs(lvl - dayLo) <= tol)
+    box4h or boxDay
+
+//=====================================================================
+// NEWS
+//=====================================================================
+
+f_events() =>
+    array<int> ev = array.new<int>()
+    bool weekday = nyDow >= dayofweek.monday and nyDow <= dayofweek.friday
+    if news0830 and weekday
+        array.push(ev, f_nyTs(8, 30))
+    if news1000 and weekday
+        array.push(ev, f_nyTs(10, 0))
+    if newsManualOn
+        array.push(ev, newsT1)
+        array.push(ev, newsT2)
+        array.push(ev, newsT3)
+    ev
+
+array<int> events = f_events()
+
+f_newsMins(int t) =>
+    float m = na
+    for e in events
+        float d = math.abs(t - e) / 60000.0
+        if na(m) or d < m
+            m := d
+    m
+
+f_newsBetween(int a, int b) =>
+    bool hit = false
+    for e in events
+        if e >= a and e <= b
+            hit := true
+    hit
+
+float newsMins = f_newsMins(time_close)
+bool newsNear30 = not na(newsMins) and newsMins <= 30
+bool newsNear2h = not na(newsMins) and newsMins <= 120
+bool preNews = f_newsBetween(time_close, time_close + 10 * 60000)
+
+//=====================================================================
+// ACCOUNT STATE AND LOSS LIMITS
+//=====================================================================
+
+var float dayStartEq = strategy.initial_capital
+var float dayStartNet = 0.0
+var float weekStartEq = strategy.initial_capital
+var float weekStartNet = 0.0
+var int dayLosses = 0
+var int tradesToday = 0
+var int m7Today = 0
+var int consecWins = 0
+
+if newDay
+    dayStartEq := strategy.equity
+    dayStartNet := strategy.netprofit
+    dayLosses := 0
+    tradesToday := 0
+    m7Today := 0
+    if newWeek
+        weekStartEq := strategy.equity
+        weekStartNet := strategy.netprofit
+
+float dayPnlPct = (strategy.netprofit - dayStartNet) / dayStartEq * 100
+float weekPnlPct = (strategy.netprofit - weekStartNet) / weekStartEq * 100
+bool dayStopHit = dayLosses >= dayMaxLosses or dayPnlPct <= -dayMaxLossPct
+bool weekStopHit = weekPnlPct <= -weekMaxLossPct
+bool nearWeek = not weekStopHit and weekPnlPct <= -(weekMaxLossPct - nearWeekPct)
+
+//=====================================================================
+// TRADE PLANS AND THE PRE-TRADE CHECKLIST
+//=====================================================================
+
+type Plan
+    int method
+    int dir
+    float entry
+    float sl
+    float tp1
+    float tp2
+    float tp1R
+    float tp2R
+    bool isLimit = false
+    int expiry
+    int timeStop
+    bool bePartial = false
+    bool keyLevel = false
+    bool isFade = false
+    bool edgeOk = false
+    bool minStopOn = true
+    float minR = 2.0
+    bool minRtoTp1 = false
+    float sizeMult = 1.0
+    string reject = ""
+    int score = 0
+    float lots = 0.0
+    float riskPct = 0.0
+
+// Applies stop widening, target caps, minimum R, checklist lines, sizing
+// and score. Returns "" when the plan passes, otherwise the failed rule.
+f_finalize(Plan p, int confl) =>
+    string why = p.reject
+    // 6 · widen the stop to the minimum stop, never tighten it
+    if p.minStopOn
+        float minSl = p.entry - p.dir * minStop
+        p.sl := p.dir == 1 ? math.min(p.sl, minSl) : math.max(p.sl, minSl)
+    float risk = (p.entry - p.sl) * p.dir
+    if why == "" and (na(risk) or risk <= 0)
+        why := "stop on the wrong side"
+    if why == ""
+        if not na(p.tp1R)
+            p.tp1 := p.entry + p.dir * p.tp1R * risk
+        if not na(p.tp2R)
+            p.tp2 := p.entry + p.dir * p.tp2R * risk
+        // Asian session: close half at +1.5R
+        if inBkkAsia and na(p.tp1)
+            p.tp1 := p.entry + p.dir * 1.5 * risk
+            p.bePartial := true
+        // 2 · targets stop in front of an unfilled 4h gap
+        if c2On
+            if p.dir == 1 and not na(h4FvgA) and h4FvgA > p.entry
+                float capUp = h4FvgA - 0.02 * atrD
+                if not na(p.tp2) and p.tp2 > capUp
+                    p.tp2 := capUp
+                if not na(p.tp1) and p.tp1 > capUp
+                    p.tp1 := capUp
+            if p.dir == -1 and not na(h4FvgB) and h4FvgB < p.entry
+                float capDn = h4FvgB + 0.02 * atrD
+                if not na(p.tp2) and p.tp2 < capDn
+                    p.tp2 := capDn
+                if not na(p.tp1) and p.tp1 < capDn
+                    p.tp1 := capDn
+        if not na(p.tp1) and not na(p.tp2) and (p.tp1 - p.tp2) * p.dir >= 0
+            p.tp1 := na
+        if na(p.tp2)
+            why := "no target"
+    float r1 = why == "" and not na(p.tp1) ? (p.tp1 - p.entry) * p.dir / risk : na
+    float r2 = why == "" ? (p.tp2 - p.entry) * p.dir / risk : na
+    if why == ""
+        float rCheck = p.minRtoTp1 and not na(r1) ? r1 : r2
+        if na(rCheck) or rCheck < p.minR
+            why := "R " + str.tostring(rCheck, "#.##") + " < " + str.tostring(p.minR, "#.#")
+    // 1 · sell only in premium, buy only in discount
+    if why == "" and c1On
+        bool okHalf = p.dir == 1
+             ? close < eq and (not rangeDay or close < dayMid)
+             : close > eq and (not rangeDay or close > dayMid)
+        if not okHalf
+            why := "CL1 wrong half of the range"
+    // 3 · daily and 4h agree (range-edge fades only need the daily)
+    if why == "" and c3On
+        if not (dailyDir == p.dir and (h4T == p.dir or p.isFade))
+            why := "CL3 daily / 4h disagree"
+    // 4 · range regime → range-edge fades only
+    if why == "" and c4On and rangeRegime
+        bool fadeOk = p.method == 6 or p.method == 9 or ((p.method == 2 or p.method == 3) and p.edgeOk)
+        if not fadeOk
+            why := "CL4 range regime"
+    // 9 · no entry within 30 minutes of high-impact news
+    if why == "" and c9On and newsNear30
+        why := "CL9 news within 30 min"
+    // 10 · loss limits
+    if why == "" and c10On
+        if weekStopHit
+            why := "CL10 weekly stop hit"
+        else if dayStopHit
+            why := "CL10 day stop hit"
+        else if nearWeek and tradesToday >= 1
+            why := "CL10 near weekly stop: 1 trade a day"
+    // size: lots rounded down so the dollar risk never exceeds the budget
+    if why == ""
+        float rp = nearWeek ? riskNearPct : consecWins >= 2 and p.method >= 2 and p.method <= 6 ? riskUpPct : riskBasePct
+        if p.method >= 7
+            rp := math.min(rp, riskBasePct)
+        rp := rp * p.sizeMult
+        float cash = strategy.equity * rp / 100
+        float lossPerUnit = strategy.convert_to_account(risk * syminfo.pointvalue)
+        float lots = lossPerUnit > 0 ? math.floor(cash / lossPerUnit / unitsPerLot / lotStep + 1e-9) * lotStep : 0.0
+        p.lots := lots
+        p.riskPct := rp
+        if lots < lotStep
+            why := "CL10 min lot exceeds the risk budget"
+    // score 0–10 (red flags veto points; a failed line above is never offset)
+    if why == ""
+        int s = 0
+        if p.dir == biasDir
+            s += 3
+        if confl >= 2
+            s += 2
+        if r2 >= 2.5
+            s += 2
+        if p.keyLevel
+            s += 1
+        if inAnyWindow
+            s += 1
+        if not newsNear2h
+            s += 1
+        if newsNear30
+            s -= 3
+        if h4AgainstDaily and p.dir == dailyDir
+            s -= 1
+        p.score := math.max(0, math.min(10, s))
+        if p.score < minScore
+            why := "score " + str.tostring(p.score) + " < " + str.tostring(minScore)
+    why
+
+array<Plan> cands = array.new<Plan>()
+
+//=====================================================================
+// METHOD 2 · KILLZONE SWEEP → MSS → FVG / OTE
+//=====================================================================
+
+var int kzState = 0      // 0 idle · 1 swept · 2 closed back inside · 3 MSS · 4 done
+var int kzDir = 0
+var float kzLevel = na
+var float kzExt = na
+var int kzSweepBar = na
+var float kzMss = na
+var float kzLeg = na
+var float kzFvgTop = na
+var float kzFvgBot = na
+var int kzEnd = na
+
+if inKz and not inKz[1]
+    kzState := 0
+    kzDir := 0
+    kzFvgTop := na
+    kzFvgBot := na
+    kzEnd := inLkz ? f_nyTs(5, 0) : f_nyTs(10, 0)
+
+if m2On and inKz and kzState < 4
+    if kzState == 0 and biasDir != 0
+        float lvl = na
+        if biasDir == 1
+            if asiaDone and low < asiaLo
+                lvl := asiaLo
+            if not na(pdl) and low < pdl and (na(lvl) or pdl < lvl)
+                lvl := pdl
+            if not na(lvl)
+                kzExt := low
+        else
+            if asiaDone and high > asiaHi
+                lvl := asiaHi
+            if not na(pdh) and high > pdh and (na(lvl) or pdh > lvl)
+                lvl := pdh
+            if not na(lvl)
+                kzExt := high
+        if not na(lvl)
+            kzState := 1
+            kzDir := biasDir
+            kzLevel := lvl
+            kzSweepBar := bar_index
+    else if kzState >= 1
+        kzExt := kzDir == 1 ? math.min(kzExt, low) : math.max(kzExt, high)
+
+    // a candle closes back inside within 3 candles
+    if kzState == 1
+        bool back = kzDir == 1 ? close > kzLevel : close < kzLevel
+        if back
+            kzState := 2
+            kzMss := kzDir == 1 ? m5SH : m5SL
+            kzLeg := kzDir == 1 ? high : low
+            kzFvgTop := na
+            kzFvgBot := na
+        else if bar_index - kzSweepBar >= 2
+            kzState := 0
+
+    if kzState >= 2
+        bool lost = kzDir == 1 ? close < kzLevel : close > kzLevel
+        if lost
+            kzState := 1
+            kzSweepBar := bar_index
+        else
+            kzLeg := kzDir == 1 ? math.max(kzLeg, high) : math.min(kzLeg, low)
+            if kzDir == 1 and bullFvgNow and bar_index - 2 >= kzSweepBar
+                kzFvgTop := low
+                kzFvgBot := high[2]
+            else if kzDir == -1 and bearFvgNow and bar_index - 2 >= kzSweepBar
+                kzFvgTop := low[2]
+                kzFvgBot := high
+            else if not na(kzFvgBot)
+                bool gapFilled = kzDir == 1 ? low <= kzFvgBot : high >= kzFvgTop
+                if gapFilled
+                    kzFvgTop := na
+                    kzFvgBot := na
+            // market structure shift: body close beyond the last 5m swing
+            if kzState == 2 and not na(kzMss) and (kzDir == 1 ? close > kzMss : close < kzMss)
+                kzState := 3
+            if kzState == 3 and not na(kzFvgTop)
+                float leg = math.abs(kzLeg - kzExt)
+                float oteA = kzLeg - kzDir * 0.62 * leg
+                float oteB = kzLeg - kzDir * 0.79 * leg
+                bool oteOk = not m2Ote or (kzFvgBot <= math.max(oteA, oteB) and kzFvgTop >= math.min(oteA, oteB))
+                float e2 = m2EntryMid ? (kzFvgTop + kzFvgBot) / 2 : kzDir == 1 ? kzFvgTop : kzFvgBot
+                float opp = kzDir == 1 ? asiaHi : asiaLo
+                float intl = kzDir == 1 ? m5SH : m5SL
+                float tp1v = (opp - e2) * kzDir > 0 ? opp : (intl - e2) * kzDir > 0 ? intl : na
+                Plan p2 = Plan.new(
+                     method = 2, dir = kzDir, entry = e2,
+                     sl = kzExt - kzDir * math.max(3 * pip, minStop),
+                     tp1 = tp1v, tp2 = kzDir == 1 ? drawUp : drawDn,
+                     isLimit = true, expiry = kzEnd, bePartial = true, keyLevel = true,
+                     edgeOk = f_atRangeEdge(kzLevel), minR = 2.0,
+                     reject = oteOk ? "" : "M2 FVG outside the 62–79% OTE")
+                array.push(cands, p2)
+                kzState := 4
+
+//=====================================================================
+// METHOD 3 · SILVER BULLET
+//=====================================================================
+
+var bool sbDone = false
+var int sbStartT = na
+var int sbEnd = na
+
+if inSb and not inSb[1]
+    sbDone := false
+    sbStartT := time
+    sbEnd := inSb1 ? f_nyTs(4, 0) : inSb2 ? f_nyTs(11, 0) : f_nyTs(15, 0)
+
+if m3On and inSb and inSb[1] and not sbDone and biasDir != 0
+    bool fvgToDraw = biasDir == 1 ? bullFvgNow : bearFvgNow
+    if fvgToDraw
+        sbDone := true
+        float fTop = biasDir == 1 ? low : low[2]
+        float fBot = biasDir == 1 ? high[2] : high
+        float draw3 = biasDir == 1 ? drawUp : drawDn
+        float sl3 = biasDir == 1 ? lo5 - 2 * pip : hi5 + 2 * pip
+        string rej3 = fTop - fBot < m3MinFvg * pip ? "M3 FVG too small"
+             : na(draw3) or math.abs(draw3 - close) < 0.25 * atrD ? "M3 draw < 0.25 daily ATR away"
+             : c9On and f_newsBetween(sbStartT, sbEnd) ? "M3 news inside the window" : ""
+        Plan p3 = Plan.new(
+             method = 3, dir = biasDir, entry = (fTop + fBot) / 2, sl = sl3,
+             tp1R = 1.5, tp2 = draw3, isLimit = true, expiry = sbEnd, bePartial = true,
+             edgeOk = f_atRangeEdge(sl3), minR = 2.0, reject = rej3)
+        array.push(cands, p3)
+
+//=====================================================================
+// METHOD 4 · ZONES + TREND BOUNCE (1h confirmation)
+//=====================================================================
+
+if m4On and newH1 and array.size(zLo) > 0
+    int d4 = h4T == 1 and h4C > h4E50 and h4Slope > 0 ? 1
+         : h4T == -1 and h4C < h4E50 and h4Slope < 0 ? -1 : 0
+    if d4 != 0 and h1Pat * d4 > 0
+        int best4 = -1
+        float bestDist4 = na
+        for [i, zl] in zLo
+            float zh = array.get(zHi, i)
+            bool rightSide = d4 == 1 ? zl <= close : zh >= close
+            bool nearZone = close >= zl - 0.2 * atrD and close <= zh + 0.2 * atrD
+            float wick = d4 == 1 ? h1L : h1H
+            bool atZone = wick >= zl - 0.2 * atrD and wick <= zh + 0.2 * atrD
+            if rightSide and nearZone and atZone and f_zoneKey(i)
+                float dist = math.abs((zl + zh) / 2 - close)
+                if na(bestDist4) or dist < bestDist4
+                    best4 := i
+                    bestDist4 := dist
+        if best4 >= 0
+            float zl4 = array.get(zLo, best4)
+            float zh4 = array.get(zHi, best4)
+            float sl4 = d4 == 1 ? math.min(zl4, h1L) - 0.1 * atrD : math.max(zh4, h1H) + 0.1 * atrD
+            float tgt4 = f_nextZone(d4, d4 == 1 ? zh4 : zl4)
+            if na(tgt4)
+                tgt4 := d4 == 1 ? drawUp : drawDn
+            Plan p4 = Plan.new(
+                 method = 4, dir = d4, entry = close, sl = sl4, tp2 = tgt4,
+                 keyLevel = array.get(zT, best4) >= 3, minR = 2.0)
+            array.push(cands, p4)
+
+//=====================================================================
+// METHOD 5 · BREAK AND RETEST (4h break, 1h rejection)
+//=====================================================================
+
+// Newest break of a zone within the last 20 closed 4h candles.
+f_zoneBreak(float zl, float zh) =>
+    int n = array.size(h4Cs)
+    int start = math.max(0, n - 20)
+    int bDir = 0
+    int bIdx = -1
+    if n - start >= 2
+        for j = start + 1 to n - 1
+            if bDir == 0
+                float c = array.get(h4Cs, j)
+                bool belowBefore = false
+                bool aboveBefore = false
+                for k = start to j - 1
+                    float ck = array.get(h4Cs, k)
+                    if ck < zl
+                        belowBefore := true
+                    if ck > zh
+                        aboveBefore := true
+                bool bodyOk = not m5BigBody or array.get(h4Bigs, j)
+                if c > zh and belowBefore and bodyOk
+                    bDir := 1
+                    bIdx := j
+                else if c < zl and aboveBefore and bodyOk
+                    bDir := -1
+                    bIdx := j
+    [bDir, bIdx, start]
+
+if m5On and newH1 and array.size(zLo) > 0 and h1Pat != 0
+    int pick5 = -1
+    int pickDir5 = 0
+    int pickIdx5 = -1
+    int pickStart5 = 0
+    float pickDist5 = na
+    for [i, zl] in zLo
+        float zh = array.get(zHi, i)
+        [bd, bi, bs] = f_zoneBreak(zl, zh)
+        if bd != 0 and bd * h1Pat > 0
+            // a 4h close back inside the old range = failed break
+            bool failed = false
+            int n = array.size(h4Cs)
+            if bi + 1 <= n - 1
+                for j = bi + 1 to n - 1
+                    float cj = array.get(h4Cs, j)
+                    if (bd == 1 and cj < zl) or (bd == -1 and cj > zh)
+                        failed := true
+            bool retest = bd == 1
+                 ? h1L <= zh + 0.2 * atrD and h1C > zl
+                 : h1H >= zl - 0.2 * atrD and h1C < zh
+            if not failed and retest
+                float dist = math.abs((zl + zh) / 2 - close)
+                if na(pickDist5) or dist < pickDist5
+                    pick5 := i
+                    pickDir5 := bd
+                    pickIdx5 := bi
+                    pickStart5 := bs
+                    pickDist5 := dist
+    if pick5 >= 0
+        float zl5 = array.get(zLo, pick5)
+        float zh5 = array.get(zHi, pick5)
+        int n5 = array.size(h4Cs)
+        // don't fade a fresh move > 0.5 daily ATR without a 1h structure break back
+        float post = pickDir5 == 1
+             ? array.max(array.slice(h4Hs, pickIdx5, n5))
+             : array.min(array.slice(h4Ls, pickIdx5, n5))
+        float against = pickDir5 == 1 ? post - close : close - post
+        string rej5 = against > 0.5 * atrD and h1Bos != pickDir5 ? "M5 fresh move, no 1h BOS" : ""
+        float sl5 = pickDir5 == 1 ? zl5 - 0.1 * atrD : zh5 + 0.1 * atrD
+        if pickDir5 == 1 and asiaDone and asiaLo < zl5 and asiaLo >= zl5 - 0.3 * atrD
+            sl5 := math.min(sl5, asiaLo - 0.1 * atrD)
+        if pickDir5 == -1 and asiaDone and asiaHi > zh5 and asiaHi <= zh5 + 0.3 * atrD
+            sl5 := math.max(sl5, asiaHi + 0.1 * atrD)
+        // target: smaller of the measured move and the next zone
+        float pre = pickDir5 == 1
+             ? array.min(array.slice(h4Ls, pickStart5, pickIdx5))
+             : array.max(array.slice(h4Hs, pickStart5, pickIdx5))
+        float mm = pickDir5 == 1 ? zh5 + (zh5 - pre) : zl5 - (pre - zl5)
+        float nz5 = f_nextZone(pickDir5, pickDir5 == 1 ? zh5 : zl5)
+        float tgt5 = na(nz5) ? mm : pickDir5 == 1 ? math.min(mm, nz5) : math.max(mm, nz5)
+        Plan p5 = Plan.new(
+             method = 5, dir = pickDir5, entry = close, sl = sl5, tp2 = tgt5,
+             keyLevel = true, minR = 2.0, reject = rej5)
+        array.push(cands, p5)
+
+//=====================================================================
+// METHOD 6 · RANGE + FALSE-BREAKOUT FADE (1h)
+//=====================================================================
+
+f_countTouches(array<float> vals, array<int> ts, float lvl, float tol, int cutoff) =>
+    int cnt = 0
+    for [i, v] in vals
+        if array.get(ts, i) >= cutoff and math.abs(v - lvl) <= tol
+            cnt += 1
+    cnt
+
+var int fbDir = 0
+var float fbExt = na
+var int fbCount = 0
+
+if newH1 and not na(h4BxHi) and not na(h4BxLo) and h4BxHi > h4BxLo
+    float bxH = h4BxHi
+    float bxL = h4BxLo
+    float bxHt = bxH - bxL
+    // setup B tracking: a 1h candle beyond the edge, body back inside within 1–3 candles
+    int sigB = 0
+    if fbDir == 0
+        if h1H > bxH
+            fbDir := -1
+            fbExt := h1H
+            fbCount := 1
+        else if h1L < bxL
+            fbDir := 1
+            fbExt := h1L
+            fbCount := 1
+    else
+        fbCount += 1
+        fbExt := fbDir == -1 ? math.max(fbExt, h1H) : math.min(fbExt, h1L)
+    if fbDir == -1 and h1C < bxH and h1C > bxL
+        sigB := -1
+    else if fbDir == 1 and h1C > bxL and h1C < bxH
+        sigB := 1
+    float extB = fbExt
+    if sigB != 0 or fbCount >= 3
+        fbDir := 0
+        fbCount := 0
+
+    int cutoff = array.size(h4Ts) > 0 ? array.get(h4Ts, 0) : 0
+    int touchTop = f_countTouches(h4PvHi, h4PvHiT, bxH, 0.15 * bxHt, cutoff)
+    int touchBot = f_countTouches(h4PvLo, h4PvLoT, bxL, 0.15 * bxHt, cutoff)
+    bool range4hOk = h4Adx < 20 and h4T == 0 and math.abs(h4Slope) < m6Flat * atrD
+         and touchTop >= 2 and touchBot >= 2
+    bool rangeOk = (range4hOk or rangeDay) and h4Out2 == 0
+
+    if m6On and rangeOk
+        float mid6 = (bxH + bxL) / 2
+        if sigB != 0
+            float buf = isGold ? 0.1 * atrD : 7 * pip
+            float sl6 = extB - sigB * buf
+            float stop6 = math.abs(close - sl6)
+            string rej6 = stop6 > 0.25 * atrD ? "M6 false-break stop > 0.25 daily ATR"
+                 : bxHt < 2.5 * stop6 ? "M6 range < 2.5 × stop" : ""
+            Plan p6 = Plan.new(
+                 method = 6, dir = sigB, entry = close, sl = sl6, tp1 = mid6,
+                 tp2 = sigB == -1 ? bxL + 0.05 * bxHt : bxH - 0.05 * bxHt,
+                 keyLevel = true, isFade = true, minR = 1.5, reject = rej6)
+            array.push(cands, p6)
+        else
+            int sigA = h1Pat < 0 and h1H >= bxH - 0.1 * bxHt and h1H <= bxH and h1C < bxH ? -1
+                 : h1Pat > 0 and h1L <= bxL + 0.1 * bxHt and h1L >= bxL and h1C > bxL ? 1 : 0
+            if sigA != 0
+                float sl6 = sigA == -1 ? bxH + 0.1 * bxHt : bxL - 0.1 * bxHt
+                string rej6 = bxHt < 2.5 * math.abs(close - sl6) ? "M6 range < 2.5 × stop" : ""
+                Plan p6 = Plan.new(
+                     method = 6, dir = sigA, entry = close, sl = sl6, tp1 = mid6,
+                     tp2 = sigA == -1 ? bxL + 0.05 * bxHt : bxH - 0.05 * bxHt,
+                     keyLevel = true, isFade = true, minR = 1.5, reject = rej6)
+                array.push(cands, p6)
+
+//=====================================================================
+// METHOD 7 · EMA 9/21/200 TREND-PULLBACK SCALP
+//=====================================================================
+
+bool majorPair = not isGold and not isJpy
+
+if m7On and (inLonScalp or inOverlap) and m7Today < m7MaxTrades
+    int d7 = 0
+    if close > ema200 and ema9 > ema21 and ema9 - ema21 >= m7GapAtr * atr5
+         and touch9L == 1 and brk21L == 0 and close > ema9 and close[1] <= ema9[1]
+        d7 := 1
+    else if close < ema200 and ema9 < ema21 and ema21 - ema9 >= m7GapAtr * atr5
+         and touch9S == 1 and brk21S == 0 and close < ema9 and close[1] >= ema9[1]
+        d7 := -1
+    if d7 != 0
+        float sl7 = d7 == 1 ? lo6 - 1.5 * pip : hi6 + 1.5 * pip
+        float stopPips7 = math.abs(close - sl7) / pip
+        string rej7 = ""
+        if majorPair
+            if stopPips7 < 4
+                sl7 := close - d7 * 4 * pip
+            else if stopPips7 > 8
+                rej7 := "M7 stop > 8 pips"
+        Plan p7 = Plan.new(
+             method = 7, dir = d7, entry = close, sl = sl7, tp2R = 1.5,
+             minStopOn = not majorPair, minR = 1.3, reject = rej7)
+        array.push(cands, p7)
+
+//=====================================================================
+// METHOD 8 · SESSION OPENING-RANGE BREAKOUT
+//=====================================================================
+
+f_orbPlan(float oh, float ol, int oStart, int oEnd) =>
+    Plan res = na
+    float ht = oh - ol
+    int d = close >= oh + m8BufPips * pip ? 1 : close <= ol - m8BufPips * pip ? -1 : 0
+    if d != 0
+        int d1h = h1T != 0 ? h1T : h1C > h1E50 ? 1 : -1
+        string rej = ""
+        float mult = 1.0
+        if ht < m8MinPips * pip or ht > m8MaxAtr * atrD
+            rej := "M8 range size out of bounds"
+        else if c9On and f_newsBetween(oStart - 3600000, oEnd)
+            rej := "M8 range formed within 1h of news"
+        else if d != d1h
+            if m8Against
+                mult := 0.5
+            else
+                rej := "M8 against the 1h trend"
+        float edge = d == 1 ? oh : ol
+        res := Plan.new(
+             method = 8, dir = d, entry = close, sl = (oh + ol) / 2,
+             tp1 = edge + d * ht, tp2 = edge + d * 2 * ht,
+             timeStop = m8TimeStop, bePartial = true, minR = 1.0, minRtoTp1 = true,
+             sizeMult = mult, reject = rej)
+    res
+
+if m8On and lorDone and not lorTraded and time - lorEndT <= m8Expiry * 60000
+    Plan p8 = f_orbPlan(lorHi, lorLo, lorStartT, lorEndT)
+    if not na(p8)
+        lorTraded := true
+        array.push(cands, p8)
+
+if m8On and norDone and not norTraded and time - norEndT <= m8Expiry * 60000
+    Plan p8 = f_orbPlan(norHi, norLo, norStartT, norEndT)
+    if not na(p8)
+        norTraded := true
+        array.push(cands, p8)
+
+//=====================================================================
+// METHOD 9 · VWAP + BOLLINGER MEAN REVERSION
+//=====================================================================
+
+if m9On and (inM9a or inM9b) and not na(vwap) and bbwChg < 30 and vwCrossCnt >= m9Crosses
+    int d9 = 0
+    if low[1] < bbLo[1] and rsi7[1] < 20 and low[1] <= vwap[1] - atr5[1] and close > bbLo
+        d9 := 1
+    else if high[1] > bbUp[1] and rsi7[1] > 80 and high[1] >= vwap[1] + atr5[1] and close < bbUp
+        d9 := -1
+    if d9 != 0
+        float ext9 = d9 == 1 ? math.min(low, low[1]) : math.max(high, high[1])
+        float sl9 = ext9 - d9 * 2 * pip
+        string rej9 = majorPair and math.abs(close - sl9) > 8 * pip ? "M9 stop > 8 pips" : ""
+        Plan p9 = Plan.new(
+             method = 9, dir = d9, entry = close, sl = sl9, tp1 = bbMid, tp2 = vwap,
+             timeStop = m9TimeStop, bePartial = true, isFade = true, minR = 1.0,
+             minRtoTp1 = true, minStopOn = isGold, reject = rej9)
+        array.push(cands, p9)
+
+//=====================================================================
+// PLAN STATE: FILLS, RESULTS, MANAGEMENT
+//=====================================================================
+
+var bool planActive = false
+var bool planFilled = false
+var int planDir = 0
+var int planMethod = 0
+var int planScore = 0
+var float planEntry = na
+var float planSl = na
+var float planTp1 = na
+var float planTp2 = na
+var float planRisk = na
+var float planQty = na
+var int planExpiry = na
+var int planTimeStop = na
+var int planFillT = na
+var bool planBePartial = false
+var bool planBe = false
+var float planMaxFav = 0.0
+var int planClosedAt = 0
+
+string entryId = planDir == 1 ? "Long" : "Short"
+
+// fills and closed positions
+if planActive
+    if not planFilled and strategy.position_size != 0
+        planFilled := true
+        planFillT := time
+        tradesToday += 1
+    bool closedNow = (planFilled and strategy.position_size == 0)
+         or (not planFilled and strategy.closedtrades > planClosedAt)
+    if closedNow
+        float res = 0.0
+        if strategy.closedtrades > planClosedAt
+            for i = planClosedAt to strategy.closedtrades - 1
+                res += strategy.closedtrades.profit(i)
+        if res < 0
+            dayLosses += 1
+            consecWins := 0
+        else if res > 0
+            consecWins += 1
+        planActive := false
+        planFilled := false
+
+// management of the live plan
+if planActive
+    if planFilled
+        float fav = planDir == 1 ? high - planEntry : planEntry - low
+        planMaxFav := math.max(planMaxFav, fav)
+        bool tp1Hit = not na(planTp1) and math.abs(strategy.position_size) < planQty * 0.999
+        if planMaxFav >= 1.5 * planRisk
+            planBe := true
+        if tp1Hit and planBePartial
+            planBe := true
+        if preNews and c9On
+            if newsAction == "Breakeven"
+                planBe := true
+            else if newsAction == "Close"
+                strategy.close_all(comment = "News")
+        if not na(planTimeStop) and not tp1Hit and time_close - planFillT >= planTimeStop * 60000
+            strategy.close_all(comment = "Time stop")
+    else
+        // pending order: cancel at expiry or if the first target trades first
+        float firstTgt = na(planTp1) ? planTp2 : planTp1
+        bool tgtFirst = planDir == 1 ? high >= firstTgt : low <= firstTgt
+        if (not na(planExpiry) and time_close >= planExpiry) or tgtFirst
+            strategy.cancel(entryId)
+            planActive := false
+
+//=====================================================================
+// PICK THE BEST PLAN AND PLACE IT
+//=====================================================================
+
+int nLong = 0
+int nShort = 0
+for p in cands
+    if p.reject == ""
+        if p.dir == 1
+            nLong += 1
+        else
+            nShort += 1
+
+bool canPlan = not planActive and strategy.position_size == 0
+Plan best = na
+if canPlan
+    for p in cands
+        string why = f_finalize(p, p.dir == 1 ? nLong : nShort)
+        if why == ""
+            if na(best) or p.score > best.score
+                best := p
+        else if showRejected
+            label.new(
+                 bar_index, p.dir == 1 ? low : high,
+                 "✕ M" + str.tostring(p.method) + " " + why,
+                 style = p.dir == 1 ? label.style_label_up : label.style_label_down,
+                 color = color.new(color.gray, 70), textcolor = color.gray, size = size.tiny)
+
+if canPlan and not na(best)
+    string id = best.dir == 1 ? "Long" : "Short"
+    float qty = best.lots * unitsPerLot
+    strategy.entry(
+         id, best.dir == 1 ? strategy.long : strategy.short, qty = qty,
+         limit = best.isLimit ? best.entry : na,
+         comment = "M" + str.tostring(best.method) + " " + str.tostring(best.score) + "/10")
+    planActive := true
+    planFilled := false
+    planDir := best.dir
+    planMethod := best.method
+    planScore := best.score
+    planEntry := best.entry
+    planSl := best.sl
+    planTp1 := best.tp1
+    planTp2 := best.tp2
+    planRisk := math.abs(best.entry - best.sl)
+    planQty := qty
+    planExpiry := best.expiry
+    planTimeStop := best.timeStop
+    planFillT := na
+    planBePartial := best.bePartial
+    planBe := false
+    planMaxFav := 0.0
+    planClosedAt := strategy.closedtrades
+    entryId := id
+    if best.method == 7
+        m7Today += 1
+    string txt = "M" + str.tostring(best.method) + (best.dir == 1 ? " BUY" : " SELL")
+         + (best.isLimit ? " limit" : "") + " · " + str.tostring(best.score) + "/10"
+         + "\nEntry " + f_fmt(best.entry) + "  SL " + f_fmt(best.sl)
+         + "\nTP1 " + f_fmt(best.tp1) + "  TP2 " + f_fmt(best.tp2)
+         + "\n" + str.tostring(best.lots, "#.##") + " lots · " + str.tostring(best.riskPct, "#.##") + "% risk"
+    label.new(
+         bar_index, best.dir == 1 ? low : high, txt,
+         style = best.dir == 1 ? label.style_label_up : label.style_label_down,
+         color = best.dir == 1 ? color.new(color.teal, 10) : color.new(color.red, 10),
+         textcolor = color.white, size = size.small)
+
+// exits: 50% at TP1, rest at TP2, stop moves to entry at +1.5R / after TP1
+if planActive
+    float stopNow = planBe ? planEntry : planSl
+    bool tp1Done = planFilled and not na(planTp1) and math.abs(strategy.position_size) < planQty * 0.999
+    if not na(planTp1) and not tp1Done
+        strategy.exit(
+             "TP1", entryId, qty_percent = 50, limit = planTp1, stop = stopNow,
+             comment_profit = "TP1", comment_loss = planBe ? "BE" : "SL")
+    strategy.exit(
+         "Exit", entryId, limit = planTp2, stop = stopNow,
+         comment_profit = "TP2", comment_loss = planBe ? "BE" : "SL")
+
+//=====================================================================
+// PLOTS
+//=====================================================================
+
+plot(showLevels ? eq : na, "Daily equilibrium (50%)", color.new(color.gray, 20), 2, plot.style_linebr)
+plot(showLevels ? pdh : na, "Previous day high", color.new(color.orange, 30), 1, plot.style_linebr)
+plot(showLevels ? pdl : na, "Previous day low", color.new(color.orange, 30), 1, plot.style_linebr)
+plot(showLevels and asiaDone ? asiaHi : na, "Asian high", color.new(color.purple, 30), 1, plot.style_linebr)
+plot(showLevels and asiaDone ? asiaLo : na, "Asian low", color.new(color.purple, 30), 1, plot.style_linebr)
+plot(showLevels ? vwap : na, "VWAP (London open)", color.new(color.blue, 20), 1, plot.style_linebr)
+plot(showEmas ? ema9 : na, "EMA 9", color.new(color.lime, 0))
+plot(showEmas ? ema21 : na, "EMA 21", color.new(color.yellow, 0))
+plot(showEmas ? ema200 : na, "EMA 200", color.new(color.white, 0), 2)
+
+plot(planActive ? planEntry : na, "Plan entry", color.new(color.aqua, 0), 1, plot.style_linebr)
+plot(planActive ? (planBe ? planEntry : planSl) : na, "Plan stop", color.new(color.red, 0), 2, plot.style_linebr)
+plot(planActive ? planTp1 : na, "Plan TP1", color.new(color.green, 30), 1, plot.style_linebr)
+plot(planActive ? planTp2 : na, "Plan TP2", color.new(color.green, 0), 2, plot.style_linebr)
+
+bgcolor(showWindows and inLkz ? color.new(color.blue, 92) : na, title = "London killzone")
+bgcolor(showWindows and inNykz ? color.new(color.orange, 92) : na, title = "New York killzone")
+bgcolor(showWindows and inSb ? color.new(color.yellow, 90) : na, title = "Silver Bullet")
+
+//=====================================================================
+// DASHBOARD
+//=====================================================================
+
+f_row(table t, int r, string k, string v, color c) =>
+    table.cell(t, 0, r, k, text_color = color.gray, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, v, text_color = c, text_size = size.small, text_halign = text.align_left)
+
+var table dash = table.new(position.top_right, 2, 14, bgcolor = color.new(color.black, 15), border_width = 1)
+
+if showTable and barstate.islast
+    string biasTxt = biasDir == 1 ? "Bullish" : biasDir == -1 ? "Bearish" : tfConflict ? "None (W/D conflict)" : "None"
+    color biasCol = biasDir == 1 ? color.teal : biasDir == -1 ? color.red : color.silver
+    string trendTxt = (dTrend == 1 ? "Bull" : dTrend == -1 ? "Bear" : "Range") + " / " + (h4T == 1 ? "Bull" : h4T == -1 ? "Bear" : "Range")
+    string limitTxt = weekStopHit ? "WEEKLY STOP" : dayStopHit ? "DAY STOP" : nearWeek ? "Near weekly stop" : "OK"
+    color limitCol = weekStopHit or dayStopHit ? color.red : nearWeek ? color.orange : color.teal
+    string planTxt = planActive
+         ? "M" + str.tostring(planMethod) + (planDir == 1 ? " long " : " short ") + (planFilled ? "open" : "pending") + " · " + str.tostring(planScore) + "/10"
+         : "No trade"
+    f_row(dash, 0, "Bias (method 1)", biasTxt, biasCol)
+    f_row(dash, 1, "Price zone", close < eq ? "Discount" : "Premium", color.white)
+    f_row(dash, 2, "Daily / 4h trend", trendTxt, color.white)
+    f_row(dash, 3, "Regime", (rangeRegime ? "Range" : "Trending") + " · ADX " + str.tostring(h4Adx, "#.0") + (rangeDay ? " · range day" : ""), rangeRegime ? color.orange : color.white)
+    f_row(dash, 4, "Draw on liquidity", biasDir == 1 ? f_fmt(drawUp) : biasDir == -1 ? f_fmt(drawDn) : "—", color.white)
+    f_row(dash, 5, "Daily ATR (pips)", str.tostring(atrD / pip, "#.0"), color.white)
+    f_row(dash, 6, "Min stop (pips)", str.tostring(minStop / pip, "#.0"), color.white)
+    f_row(dash, 7, "Day P&L", str.tostring(dayPnlPct, "#.##") + "% · " + str.tostring(dayLosses) + " losses", dayPnlPct < 0 ? color.red : color.teal)
+    f_row(dash, 8, "Week P&L", str.tostring(weekPnlPct, "#.##") + "%", weekPnlPct < 0 ? color.red : color.teal)
+    f_row(dash, 9, "Limits", limitTxt, limitCol)
+    f_row(dash, 10, "Wins in a row", str.tostring(consecWins), color.white)
+    f_row(dash, 11, "News", na(newsMins) ? "No events set" : str.tostring(newsMins, "#") + " min to nearest", newsNear30 ? color.red : color.white)
+    f_row(dash, 12, "Plan", planTxt, planActive ? color.aqua : color.silver)
+    f_row(dash, 13, "Chart", timeframe.in_seconds() == 300 ? "5m ✓" : "Use a 5m chart", timeframe.in_seconds() == 300 ? color.teal : color.orange)
